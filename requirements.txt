@@ -1,0 +1,26 @@
+# Core
+anthropic==0.49.0
+langgraph==0.2.74
+langchain-core==0.3.52
+flask==3.1.0
+flask-cors==5.0.0
+flask-limiter==3.9.4
+python-dotenv==1.1.0
+pydantic==2.11.3
+
+# Security scanning tools (Python-based)
+bandit==1.8.3
+pip-audit==2.9.0
+truffleHog3==3.0.9
+
+# Utilities
+requests==2.32.3
+rich==14.0.0        # pretty terminal output
+python-dateutil==2.9.0
+
+# Azure (optional - for Cosmos audit log)
+azure-cosmos==4.9.0
+
+# Testing
+pytest==8.3.5
+pytest-asyncio==0.25.3
