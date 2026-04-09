@@ -8,3 +8,4 @@ from .validator import (
     SessionNotApproved, ActiveModeNotConfirmed,
 )
 from .audit import log_audit_entry, get_session_log
+from .mitre import enrich_finding, enrich_all, get_tactic_summary

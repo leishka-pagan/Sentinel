@@ -23,6 +23,9 @@ from sentinel.core import (
 )
 from sentinel.agents.sast_agent import run_sast_agent
 from sentinel.agents.deps_agent import run_deps_agent
+from sentinel.agents.config_agent import run_config_agent
+from sentinel.agents.recon_agent import run_recon_agent
+from sentinel.core.mitre import enrich_all, get_tactic_summary
 
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -101,7 +104,24 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
             all_findings.extend(findings)
             agents_run.append(AgentName.DEPS)
 
-        # Phase 2+: recon_agent, config_agent added here
+        elif agent_name == AgentName.CONFIG:
+            print(f"[ORCHESTRATOR] → Dispatching Config agent")
+            findings = run_config_agent(
+                session,
+                target_url=session.target if session.target.startswith("http") else None,
+                source_path=source_path,
+            )
+            all_findings.extend(findings)
+            agents_run.append(AgentName.CONFIG)
+
+        elif agent_name == AgentName.RECON:
+            print(f"[ORCHESTRATOR] → Dispatching Recon agent on {session.target}")
+            findings = run_recon_agent(session, session.target)
+            all_findings.extend(findings)
+            agents_run.append(AgentName.RECON)
+
+    # MITRE ATT&CK enrichment on all findings
+    all_findings = enrich_all(all_findings)
 
     # Step 3: Build final result
     result = _build_result(session, all_findings, agents_run)

@@ -14,7 +14,7 @@ All scan endpoints require an authorized session token.
 
 import os
 import uuid
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -27,7 +27,7 @@ from sentinel.core.audit import get_session_log, get_full_log
 from sentinel.agents import run_orchestrator, generate_report
 
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="templates")
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-key-change-in-prod")
 
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -43,6 +43,13 @@ limiter = Limiter(
 _sessions: dict[str, ScanSession] = {}
 # In-memory results store
 _results: dict[str, dict] = {}
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+def index():
+    return render_template("index.html")
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
