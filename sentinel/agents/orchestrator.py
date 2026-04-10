@@ -11,7 +11,7 @@ from sentinel.core.attack_chains import analyze_attack_chains, chains_to_dict
 from sentinel.core.delta import compute_delta, delta_to_markdown
 from sentinel.core.threat_intel import load_attack_data, enrich_finding_intel
 from sentinel.core.nvd_lookup import scan_service_versions
-from sentinel.agents.alpha_agent import AlphaAgent, execute_targeted_probe
+from sentinel.agents.queen_agent import QueenAgent
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MODEL  = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
@@ -20,7 +20,7 @@ MAX_ITERATIONS = 5
 SYSTEM = """You are Sentinel's Orchestrator — a blue team AI security coordinator.
 Plan scans, adapt based on findings, think like a defender finding every vulnerability first.
 
-Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent, probe_agent, js_agent, api_agent, disclosure_agent
+Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent, probe_agent, js_agent, api_agent, disclosure_agent, injection_agent, auth_scan_agent
 
 Rules:
 - Never suggest exploitation. Never fabricate CVEs.
@@ -104,19 +104,16 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     all_findings = _enrich_intel(all_findings)
     all_findings.extend(_nvd_check(session, all_findings))
 
-    # ALPHA AGENT — strategic reasoning layer
-    # Runs after initial agent sweep for PROBE and ACTIVE modes
+    # QUEEN — sovereign commander
+    # Queen takes control for PROBE and ACTIVE modes
+    # She commands Alphas, correlates findings, delivers the final verdict
     if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE) and all_findings:
-        print(f"\n[ORCHESTRATOR] Handing off to Alpha Agent for strategic analysis...")
-        alpha_findings = _run_alpha_investigation(
-            session, all_findings, agents_run, done, source_path
-        )
-        if alpha_findings:
-            all_findings.extend(alpha_findings)
-            all_findings = enrich_all(alpha_findings) + [
-                f for f in all_findings if f not in alpha_findings
-            ]
-            print(f"[ORCHESTRATOR] Alpha contributed {len(alpha_findings)} additional findings")
+        print(f"\n[ORCHESTRATOR] Queen taking command...")
+        queen = QueenAgent(session, source_path)
+        queen_findings = queen.command(all_findings, done)
+        if queen_findings:
+            all_findings.extend(queen_findings)
+            print(f"[ORCHESTRATOR] Queen contributed {len(queen_findings)} additional findings")
 
     result = _build_result(session, all_findings, agents_run)
 
@@ -176,6 +173,14 @@ def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> l
             from sentinel.agents.disclosure_agent import run_disclosure_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
             return run_disclosure_agent(session, url)
+        elif agent == "injection_agent":
+            from sentinel.agents.injection_agent import run_injection_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_injection_agent(session, url)
+        elif agent == "auth_scan_agent":
+            from sentinel.agents.auth_scan_agent import run_auth_scan_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_auth_scan_agent(session, url)
         else:
             return []
     except Exception as e:
@@ -228,10 +233,12 @@ def _default_agents(session: ScanSession, source_path: Optional[str]) -> list[st
         return ["recon_agent", "config_agent", "network_agent"]
     elif session.mode == ScanMode.PROBE:
         return ["recon_agent", "config_agent", "network_agent",
-                "probe_agent", "js_agent", "api_agent", "disclosure_agent"]
+                "probe_agent", "js_agent", "api_agent", "disclosure_agent",
+                "injection_agent", "auth_scan_agent"]
     elif session.mode == ScanMode.ACTIVE:
         agents = ["recon_agent", "config_agent", "network_agent",
-                  "probe_agent", "js_agent", "api_agent", "disclosure_agent"]
+                  "probe_agent", "js_agent", "api_agent", "disclosure_agent",
+                  "injection_agent", "auth_scan_agent"]
         if source_path: agents += ["sast_agent", "deps_agent", "logic_agent"]
         agents.append("nuclei_agent")
         return agents

@@ -45,6 +45,8 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         "spider_passive",       # Crawl links, do not submit forms
         "endpoint_discovery",   # Map API endpoints
         "error_trigger",        # Trigger errors to check for disclosure
+        "injection_probe",      # Single-char error probing for injection conditions
+        "authenticated_scan",   # Scan with auth context
     },
     ScanMode.ACTIVE: {
         "dns_lookup",
@@ -70,6 +72,8 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         "spider_passive",
         "endpoint_discovery",
         "error_trigger",
+        "injection_probe",
+        "authenticated_scan",
     },
 }
 

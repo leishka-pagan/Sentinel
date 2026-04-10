@@ -14,3 +14,4 @@ from .delta import compute_delta, delta_to_markdown
 from .threat_intel import load_attack_data, enrich_finding_intel
 from .nvd_lookup import lookup_cves, get_cve_details
 from .consensus import consensus_analyze, consensus_findings_to_sentinel
+from .auth_context import AuthContext, get_test_credentials
