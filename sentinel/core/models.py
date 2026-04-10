@@ -13,8 +13,9 @@ import uuid
 # ── Scan Modes ────────────────────────────────────────────────────────────────
 
 class ScanMode(str, Enum):
-    PASSIVE = "PASSIVE"   # Recon + Config only. Read-only, no probing.
+    PASSIVE = "PASSIVE"   # Recon + Config only. Read-only observation.
     CODE    = "CODE"      # SAST + Deps only. No network activity.
+    PROBE   = "PROBE"     # Active-safe probing. Finds real vulns. No exploitation.
     ACTIVE  = "ACTIVE"    # All agents. Requires double confirmation.
 
 
@@ -39,6 +40,10 @@ class AgentName(str, Enum):
     NUCLEI       = "nuclei_agent"
     LOGIC        = "logic_agent"
     NETWORK      = "network_agent"
+    PROBE        = "probe_agent"
+    JS           = "js_agent"
+    API          = "api_agent"
+    DISCLOSURE   = "disclosure_agent"
     AGGREGATOR   = "aggregator"
     REPORTER     = "reporter"
 

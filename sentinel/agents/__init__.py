@@ -6,4 +6,8 @@ from .recon_agent import run_recon_agent
 from .nuclei_agent import run_nuclei_agent
 from .logic_agent import run_logic_agent
 from .network_agent import run_network_agent
+from .probe_agent import run_probe_agent
+from .js_analysis_agent import run_js_agent
+from .api_agent import run_api_agent
+from .disclosure_agent import run_disclosure_agent
 from .reporter import generate_report

@@ -51,7 +51,10 @@ def _dns_lookup(session: ScanSession, target: str) -> list[Finding]:
     validate_action(AgentName.RECON, "dns_lookup", target, session)
 
     findings = []
-    clean = target.replace("http://", "").replace("https://", "").split("/")[0]
+    # Strip protocol, path, AND port to get bare hostname
+    from urllib.parse import urlparse
+    parsed = urlparse(target if "://" in target else "http://" + target)
+    clean = parsed.hostname or target
 
     try:
         ip = socket.gethostbyname(clean)
@@ -167,7 +170,10 @@ def _whois_lookup(session: ScanSession, target: str) -> list[Finding]:
     validate_action(AgentName.RECON, "whois_lookup", target, session)
 
     findings = []
-    clean = target.replace("http://", "").replace("https://", "").split("/")[0]
+    # Strip protocol, path, AND port to get bare hostname
+    from urllib.parse import urlparse
+    parsed = urlparse(target if "://" in target else "http://" + target)
+    clean = parsed.hostname or target
 
     # Skip WHOIS for IPs and localhost
     if clean in ("localhost", "127.0.0.1") or clean.replace(".", "").isdigit():
@@ -205,7 +211,10 @@ def _port_scan_passive(session: ScanSession, target: str) -> list[Finding]:
     """Ping scan only — confirms host is up. No port enumeration."""
     validate_action(AgentName.RECON, "port_scan_passive", target, session)
 
-    clean = target.replace("http://", "").replace("https://", "").split("/")[0]
+    # Strip protocol, path, AND port to get bare hostname
+    from urllib.parse import urlparse
+    parsed = urlparse(target if "://" in target else "http://" + target)
+    clean = parsed.hostname or target
     findings = []
 
     try:
@@ -236,7 +245,10 @@ def _port_scan_active(session: ScanSession, target: str) -> list[Finding]:
     """Port scan — ACTIVE mode only. Enumerates common ports."""
     validate_action(AgentName.RECON, "port_scan_active", target, session)
 
-    clean = target.replace("http://", "").replace("https://", "").split("/")[0]
+    # Strip protocol, path, AND port to get bare hostname
+    from urllib.parse import urlparse
+    parsed = urlparse(target if "://" in target else "http://" + target)
+    clean = parsed.hostname or target
     findings = []
 
     # High-risk ports to flag

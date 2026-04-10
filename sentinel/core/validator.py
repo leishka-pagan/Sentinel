@@ -35,6 +35,17 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         "file_read",
         "logic_analysis",   # Claude code reasoning — no network
     },
+
+    ScanMode.PROBE: {
+        # Everything PASSIVE can do +
+        "dns_lookup", "whois_lookup", "http_headers", "header_analysis",
+        "port_scan_passive", "config_read",
+        # PROBE-specific — active but safe probing
+        "http_probe",           # Send HTTP requests, observe responses
+        "spider_passive",       # Crawl links, do not submit forms
+        "endpoint_discovery",   # Map API endpoints
+        "error_trigger",        # Trigger errors to check for disclosure
+    },
     ScanMode.ACTIVE: {
         "dns_lookup",
         "whois_lookup",
@@ -54,6 +65,11 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         "subfinder_scan",
         "logic_analysis",
         "network_topology",
+        # PROBE actions also available in ACTIVE
+        "http_probe",
+        "spider_passive",
+        "endpoint_discovery",
+        "error_trigger",
     },
 }
 

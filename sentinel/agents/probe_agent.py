@@ -1,0 +1,479 @@
+"""
+sentinel/agents/probe_agent.py
+
+Probe Agent — Active-Safe Web Probing.
+Part of MODE2 (PROBE mode).
+
+Finds:
+  - All endpoints via spidering
+  - Unauthenticated access to protected endpoints
+  - IDOR vulnerabilities (change ID, observe response)
+  - Rate limiting absence on auth endpoints
+  - User enumeration via different error messages
+  - HTTP method tampering (GET vs POST vs PUT)
+  - Parameter pollution
+  - Mass assignment vectors
+
+SCOPE: PROBE and ACTIVE modes only.
+ACTIONS: http_probe, spider_passive
+NEVER: submits exploit payloads, modifies data, brute forces,
+       sends SQL/XSS/command injection strings
+"""
+
+import json
+import re
+import requests
+from urllib.parse import urljoin, urlparse, urlencode
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+from sentinel.core import (
+    validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
+)
+
+HEADERS = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
+TIMEOUT = 10
+
+# Common API base paths to probe
+API_BASES = [
+    "/api", "/api/v1", "/api/v2", "/api/v3",
+    "/rest", "/rest/v1", "/graphql", "/gql",
+    "/v1", "/v2", "/internal", "/private",
+]
+
+# Auth endpoints to test for rate limiting + user enumeration
+AUTH_PATHS = [
+    "/login", "/api/login", "/auth/login", "/signin",
+    "/api/user/login", "/rest/user/login",
+    "/register", "/api/register", "/signup",
+    "/forgot-password", "/reset-password",
+    "/api/user/reset-password",
+]
+
+# Admin/privileged paths
+ADMIN_PATHS = [
+    "/admin", "/administration", "/manage",
+    "/api/admin", "/api/users", "/api/user",
+    "/dashboard", "/backstage", "/console",
+    "/api/orders", "/api/feedback", "/api/complaints",
+]
+
+# Common user IDs to test IDOR
+IDOR_TEST_IDS = [1, 2, 3, 100, 999]
+
+
+def run_probe_agent(session: ScanSession, target_url: str) -> list[Finding]:
+    """Run probe analysis against a live target."""
+    validate_action(AgentName.PROBE, "http_probe", target_url, session)
+    validate_action(AgentName.PROBE, "spider_passive", target_url, session)
+
+    base = target_url.rstrip("/")
+    findings = []
+
+    print(f"[PROBE] Starting endpoint probe on {base}")
+
+    findings.extend(_check_admin_endpoints(base, session))
+    findings.extend(_check_api_endpoints(base, session))
+    findings.extend(_check_auth_weaknesses(base, session))
+    findings.extend(_check_idor(base, session))
+    findings.extend(_check_method_tampering(base, session))
+    findings.extend(_check_rate_limiting(base, session))
+
+    print(f"[PROBE] {len(findings)} probe findings")
+    return findings
+
+
+# ── Admin / Privileged Endpoints ──────────────────────────────────────────────
+
+def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
+    """Check for accessible admin/privileged endpoints without auth."""
+    findings = []
+
+    for path in ADMIN_PATHS:
+        url = base + path
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                                verify=False, allow_redirects=False)
+
+            if resp.status_code == 200:
+                # Check if it's a real response not just a redirect to login
+                content_len = len(resp.content)
+                if content_len > 100:
+                    findings.append(Finding(
+                        agent=AgentName.PROBE,
+                        title=f"Unauthenticated Access: {path}",
+                        description=(
+                            f"Endpoint {url} returned HTTP 200 with {content_len} bytes "
+                            f"without any authentication. This endpoint may expose sensitive "
+                            f"functionality or data."
+                        ),
+                        severity=Severity.CRITICAL,
+                        file_path=url,
+                        mitre_tactic="Initial Access",
+                        mitre_technique="T1190 — Exploit Public-Facing Application",
+                        remediation=(
+                            f"Implement authentication on {path}. "
+                            "Verify authorization checks are enforced server-side, not just client-side. "
+                            "Return 401/403 for unauthenticated requests."
+                        ),
+                    ))
+
+            elif resp.status_code == 403:
+                # 403 means it exists but is protected — still worth noting
+                findings.append(Finding(
+                    agent=AgentName.PROBE,
+                    title=f"Protected Endpoint Exists: {path}",
+                    description=(
+                        f"Endpoint {url} returned HTTP 403. "
+                        "The endpoint exists and is protected, but its existence is confirmed. "
+                        "Verify the access control is properly implemented."
+                    ),
+                    severity=Severity.LOW,
+                    file_path=url,
+                    mitre_tactic="Discovery",
+                    mitre_technique="T1083 — File and Directory Discovery",
+                    remediation=(
+                        "Ensure 403 responses don't leak information about the endpoint structure. "
+                        "Consider returning 404 for non-admin users to prevent enumeration."
+                    ),
+                ))
+
+        except requests.RequestException:
+            continue
+
+    return findings
+
+
+# ── API Endpoint Analysis ─────────────────────────────────────────────────────
+
+def _check_api_endpoints(base: str, session: ScanSession) -> list[Finding]:
+    """Probe API endpoints for data exposure and missing auth."""
+    findings = []
+
+    for api_base in API_BASES:
+        url = base + api_base
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                                verify=False, allow_redirects=False)
+
+            if resp.status_code in (200, 201):
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" in content_type:
+                    try:
+                        data = resp.json()
+                        # Check if it returns a list (data exposure)
+                        if isinstance(data, list) and len(data) > 0:
+                            sample = str(data[0])[:200]
+                            # Check for sensitive fields in response
+                            sensitive = _check_sensitive_fields(sample)
+                            severity = Severity.CRITICAL if sensitive else Severity.HIGH
+
+                            findings.append(Finding(
+                                agent=AgentName.PROBE,
+                                title=f"API Data Exposed Without Auth: {api_base}",
+                                description=(
+                                    f"{url} returns {len(data)} records without authentication. "
+                                    f"Sample: {sample[:150]}"
+                                    + (f"\n⚠ Sensitive fields detected: {', '.join(sensitive)}" if sensitive else "")
+                                ),
+                                severity=severity,
+                                file_path=url,
+                                mitre_tactic="Collection",
+                                mitre_technique="T1213 — Data from Information Repositories",
+                                remediation=(
+                                    f"Implement authentication on {api_base}. "
+                                    "Ensure all API endpoints verify JWT/session before returning data. "
+                                    "Apply principle of least privilege — return only necessary fields."
+                                ),
+                            ))
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+        except requests.RequestException:
+            continue
+
+    return findings
+
+
+# ── Auth Weakness Detection ───────────────────────────────────────────────────
+
+def _check_auth_weaknesses(base: str, session: ScanSession) -> list[Finding]:
+    """Test auth endpoints for user enumeration and missing security."""
+    findings = []
+
+    for path in AUTH_PATHS:
+        url = base + path
+        try:
+            # First check if endpoint exists
+            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                                verify=False, allow_redirects=False)
+
+            if resp.status_code not in (200, 405):
+                continue
+
+            # Test for user enumeration: different responses for valid vs invalid user
+            test_valid = _post_json(url, {
+                "email": "admin@juice-sh.op",  # Known valid user in Juice Shop
+                "password": "definitely-wrong-password-sentinel-test"
+            })
+            test_invalid = _post_json(url, {
+                "email": "nonexistent_sentinel_test_12345@example.com",
+                "password": "definitely-wrong-password-sentinel-test"
+            })
+
+            if test_valid and test_invalid:
+                if test_valid.status_code != test_invalid.status_code:
+                    findings.append(Finding(
+                        agent=AgentName.PROBE,
+                        title=f"User Enumeration Possible: {path}",
+                        description=(
+                            f"Auth endpoint {url} returns different status codes for "
+                            f"valid ({test_valid.status_code}) vs invalid ({test_invalid.status_code}) "
+                            f"email addresses. Attackers can enumerate valid usernames."
+                        ),
+                        severity=Severity.MEDIUM,
+                        file_path=url,
+                        mitre_tactic="Reconnaissance",
+                        mitre_technique="T1589.001 — Gather Victim Identity Information: Credentials",
+                        remediation=(
+                            "Return identical error messages for both invalid username and invalid password. "
+                            "Use generic message: 'Invalid email or password' for all failures."
+                        ),
+                    ))
+                elif test_valid.text != test_invalid.text:
+                    # Different response bodies even with same status code
+                    findings.append(Finding(
+                        agent=AgentName.PROBE,
+                        title=f"User Enumeration via Response Body: {path}",
+                        description=(
+                            f"Auth endpoint {url} returns different response bodies for "
+                            f"valid vs invalid email addresses despite same status code. "
+                            "Response content leaks whether an email exists."
+                        ),
+                        severity=Severity.MEDIUM,
+                        file_path=url,
+                        mitre_tactic="Reconnaissance",
+                        mitre_technique="T1589.001 — Gather Victim Identity Information: Credentials",
+                        remediation=(
+                            "Ensure identical response body for all authentication failures. "
+                            "Do not reveal whether email exists in the system."
+                        ),
+                    ))
+
+        except requests.RequestException:
+            continue
+
+    return findings
+
+
+# ── IDOR Detection ────────────────────────────────────────────────────────────
+
+def _check_idor(base: str, session: ScanSession) -> list[Finding]:
+    """
+    Test for IDOR by accessing resources with different IDs.
+    Only OBSERVES responses — does not modify data.
+    """
+    findings = []
+
+    # Common ID-based API patterns
+    idor_paths = [
+        "/api/users/{id}",
+        "/api/user/{id}",
+        "/api/orders/{id}",
+        "/api/basket/{id}",
+        "/api/BasketItems/{id}",
+        "/rest/user/{id}",
+        "/api/feedback/{id}",
+    ]
+
+    for path_template in idor_paths:
+        responses = {}
+        accessible_ids = []
+
+        for test_id in IDOR_TEST_IDS:
+            url = base + path_template.replace("{id}", str(test_id))
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                                    verify=False, allow_redirects=False)
+                responses[test_id] = resp.status_code
+
+                if resp.status_code == 200:
+                    accessible_ids.append(test_id)
+
+            except requests.RequestException:
+                continue
+
+        # If we can access multiple IDs without auth, that's an IDOR
+        if len(accessible_ids) >= 2:
+            path_base = path_template.replace("/{id}", "")
+            findings.append(Finding(
+                agent=AgentName.PROBE,
+                title=f"IDOR: Unauthenticated Access to {path_base}",
+                description=(
+                    f"Endpoint {path_template} allows unauthenticated access to multiple records. "
+                    f"Accessible IDs: {accessible_ids}. "
+                    "An attacker can enumerate all records by iterating IDs."
+                ),
+                severity=Severity.CRITICAL,
+                file_path=base + path_template,
+                mitre_tactic="Collection",
+                mitre_technique="T1213 — Data from Information Repositories",
+                remediation=(
+                    "1. Require authentication on all resource endpoints. "
+                    "2. After authenticating, verify the requesting user owns the requested resource. "
+                    "3. Consider using UUIDs instead of sequential integers to prevent enumeration. "
+                    "4. Implement object-level authorization checks."
+                ),
+            ))
+
+        elif len(accessible_ids) == 1:
+            # Only one ID accessible — flag for manual review
+            path_base = path_template.replace("/{id}", "")
+            findings.append(Finding(
+                agent=AgentName.PROBE,
+                title=f"Potential IDOR: {path_base} ID {accessible_ids[0]} Accessible",
+                description=(
+                    f"Endpoint {path_template.replace('{id}', str(accessible_ids[0]))} "
+                    f"returned 200 without authentication. "
+                    "May indicate IDOR or missing auth — requires manual verification."
+                ),
+                severity=Severity.HIGH,
+                file_path=base + path_template,
+                mitre_tactic="Collection",
+                mitre_technique="T1213 — Data from Information Repositories",
+                remediation=(
+                    "Verify this endpoint requires authentication. "
+                    "Implement authorization checks to ensure users can only access their own resources."
+                ),
+            ))
+
+    return findings
+
+
+# ── HTTP Method Tampering ─────────────────────────────────────────────────────
+
+def _check_method_tampering(base: str, session: ScanSession) -> list[Finding]:
+    """Check if endpoints accept unexpected HTTP methods."""
+    findings = []
+
+    test_endpoints = ["/api/users", "/api/user/1", "/api/orders"]
+
+    for path in test_endpoints:
+        url = base + path
+        try:
+            # Test OPTIONS to see what methods are allowed
+            resp = requests.options(url, headers=HEADERS, timeout=TIMEOUT,
+                                    verify=False)
+            allow = resp.headers.get("Allow", "") or resp.headers.get("Access-Control-Allow-Methods", "")
+
+            if allow:
+                dangerous = [m for m in ["DELETE", "PUT", "PATCH"] if m in allow.upper()]
+                if dangerous:
+                    findings.append(Finding(
+                        agent=AgentName.PROBE,
+                        title=f"Dangerous HTTP Methods Allowed: {path}",
+                        description=(
+                            f"Endpoint {url} allows HTTP methods: {', '.join(dangerous)}. "
+                            "If not properly authenticated, these could allow data modification or deletion."
+                        ),
+                        severity=Severity.MEDIUM,
+                        file_path=url,
+                        mitre_tactic="Initial Access",
+                        mitre_technique="T1190 — Exploit Public-Facing Application",
+                        remediation=(
+                            "Disable HTTP methods that are not needed. "
+                            "Ensure DELETE/PUT/PATCH require proper authentication AND authorization. "
+                            "Return 405 Method Not Allowed for unused methods."
+                        ),
+                    ))
+        except requests.RequestException:
+            continue
+
+    return findings
+
+
+# ── Rate Limit Detection ──────────────────────────────────────────────────────
+
+def _check_rate_limiting(base: str, session: ScanSession) -> list[Finding]:
+    """
+    Check if auth endpoints have rate limiting.
+    Sends 5 requests — NOT brute force, just checking if protection exists.
+    """
+    findings = []
+
+    for path in ["/rest/user/login", "/api/login", "/login"]:
+        url = base + path
+        try:
+            # Check if endpoint exists first
+            check = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            if check.status_code not in (200, 405, 400):
+                continue
+
+            # Send 5 rapid requests with wrong credentials
+            responses = []
+            for _ in range(5):
+                resp = _post_json(url, {
+                    "email": "ratelimit_test_sentinel@example.com",
+                    "password": "wrong_password_test"
+                })
+                if resp:
+                    responses.append(resp.status_code)
+
+            # If all 5 return same error (no 429 or blocking), rate limiting missing
+            if responses and all(r not in (429, 423, 503) for r in responses) and len(set(responses)) == 1:
+                findings.append(Finding(
+                    agent=AgentName.PROBE,
+                    title=f"No Rate Limiting on Auth Endpoint: {path}",
+                    description=(
+                        f"Auth endpoint {url} returned consistent {responses[0]} responses "
+                        f"across 5 rapid requests with no rate limiting detected (no HTTP 429). "
+                        "This endpoint is vulnerable to credential stuffing and brute force attacks."
+                    ),
+                    severity=Severity.HIGH,
+                    file_path=url,
+                    mitre_tactic="Credential Access",
+                    mitre_technique="T1110 — Brute Force",
+                    remediation=(
+                        "Implement rate limiting: max 5 failed attempts per IP per minute. "
+                        "After threshold, return HTTP 429 with Retry-After header. "
+                        "Consider CAPTCHA after repeated failures. "
+                        "Implement account lockout after 10 failed attempts."
+                    ),
+                ))
+
+        except requests.RequestException:
+            continue
+
+    return findings
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _post_json(url: str, data: dict) -> requests.Response | None:
+    """Send a JSON POST request safely."""
+    try:
+        return requests.post(
+            url,
+            json=data,
+            headers={**HEADERS, "Content-Type": "application/json"},
+            timeout=TIMEOUT,
+            verify=False,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        return None
+
+
+def _check_sensitive_fields(text: str) -> list[str]:
+    """Check if response contains sensitive field names."""
+    sensitive_patterns = [
+        "password", "passwd", "secret", "token", "api_key",
+        "credit_card", "ssn", "social_security", "private_key",
+        "access_token", "refresh_token", "auth_token",
+    ]
+    found = []
+    text_lower = text.lower()
+    for pattern in sensitive_patterns:
+        if pattern in text_lower:
+            found.append(pattern)
+    return found

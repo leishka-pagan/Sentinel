@@ -19,10 +19,10 @@ MAX_ITERATIONS = 5
 SYSTEM = """You are Sentinel's Orchestrator — a blue team AI security coordinator.
 Plan scans, adapt based on findings, think like a defender finding every vulnerability first.
 
-Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent
+Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent, probe_agent, js_agent, api_agent, disclosure_agent
 
 Rules: Never suggest exploitation. Never fabricate CVEs. Only dispatch agents valid for the mode.
-PASSIVE=recon/config/network only. CODE=sast/deps/logic only. ACTIVE=all agents.
+PASSIVE=recon/config/network only. CODE=sast/deps/logic only. PROBE=probe/js/api/disclosure/config/recon/network. ACTIVE=all agents.
 
 Return JSON only. No markdown, no preamble.
 Initial plan format: {"agents_to_run": ["agent_name"], "rationale": "why"}
@@ -121,6 +121,22 @@ def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> l
             from sentinel.agents.nuclei_agent import run_nuclei_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
             return run_nuclei_agent(session, url)
+        elif agent == "probe_agent":
+            from sentinel.agents.probe_agent import run_probe_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_probe_agent(session, url)
+        elif agent == "js_agent":
+            from sentinel.agents.js_analysis_agent import run_js_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_js_agent(session, url)
+        elif agent == "api_agent":
+            from sentinel.agents.api_agent import run_api_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_api_agent(session, url)
+        elif agent == "disclosure_agent":
+            from sentinel.agents.disclosure_agent import run_disclosure_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_disclosure_agent(session, url)
         else:
             return []
     except Exception as e:
@@ -171,8 +187,12 @@ def _default_agents(session: ScanSession, source_path: Optional[str]) -> list[st
         return ["sast_agent", "deps_agent", "logic_agent"] if source_path else []
     elif session.mode == ScanMode.PASSIVE:
         return ["recon_agent", "config_agent", "network_agent"]
+    elif session.mode == ScanMode.PROBE:
+        return ["recon_agent", "config_agent", "network_agent",
+                "probe_agent", "js_agent", "api_agent", "disclosure_agent"]
     elif session.mode == ScanMode.ACTIVE:
-        agents = ["recon_agent", "config_agent", "network_agent"]
+        agents = ["recon_agent", "config_agent", "network_agent",
+                  "probe_agent", "js_agent", "api_agent", "disclosure_agent"]
         if source_path: agents += ["sast_agent", "deps_agent", "logic_agent"]
         agents.append("nuclei_agent")
         return agents
@@ -193,13 +213,38 @@ def _enrich_intel(findings: list[Finding]) -> list[Finding]:
 
 def _nvd_check(session: ScanSession, findings: list[Finding]) -> list[Finding]:
     import re
+
+    # Strict allowlist — only real software names we care about CVEs for
+    KNOWN_SERVICES = {
+        "nginx", "apache", "iis", "tomcat", "jetty", "node", "nodejs",
+        "express", "django", "flask", "rails", "spring", "struts",
+        "openssl", "openssh", "wordpress", "drupal", "joomla",
+        "mysql", "postgresql", "redis", "mongodb", "elasticsearch",
+        "jenkins", "gitlab", "jira", "confluence", "grafana",
+        "php", "python", "ruby", "java", "golang",
+    }
+
+    # Match "nginx/1.14.0" or "Apache 2.4.1" style version strings only
+    VERSION_PATTERN = re.compile(r'\b([\w\-\.]+)[/\s]+([\d]+\.[\d]+[\.[\d]*]*)\b')
+
     services = {}
     for f in findings:
         if f.agent in (AgentName.RECON, AgentName.NETWORK, AgentName.CONFIG):
-            for service, version in re.findall(r'(\w+)[/\s]+([\d.]+)', f.description or ""):
-                if service.lower() not in ("http","the","a","at","on"):
-                    services[service.lower()] = version
-    if not services: return []
+            text = (f.title or "") + " " + (f.description or "")
+            for service, version in VERSION_PATTERN.findall(text):
+                service_clean = service.lower().strip()
+                # Must be known service AND have real version (not port numbers)
+                try:
+                    major = int(version.split(".")[0])
+                except Exception:
+                    continue
+                if (service_clean in KNOWN_SERVICES and
+                        len(version) < 15 and
+                        major < 100):
+                    services[service_clean] = version
+
+    if not services:
+        return []
     print(f"[ORCHESTRATOR] NVD checking: {services}")
     nvd_results = scan_service_versions(services)
     nvd_findings = []
