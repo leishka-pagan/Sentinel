@@ -27,13 +27,13 @@ MAX_ITERATIONS = 5
 SYSTEM = """You are Sentinel's Orchestrator — a blue team AI security coordinator.
 Plan scans, adapt based on findings, think like a defender finding every vulnerability first.
 
-Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent, probe_agent, js_agent, api_agent, disclosure_agent, injection_agent, auth_scan_agent
+Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent, probe_agent, js_agent, api_agent, disclosure_agent, injection_agent, auth_scan_agent, wordpress_enum_agent, wordpress_agent, salesforce_agent
 
 Rules:
 - Never suggest exploitation. Never fabricate CVEs.
 - Only dispatch agents valid for the mode.
 - PASSIVE=recon/config/network only. CODE=sast/deps/logic only. PROBE=all probe agents. ACTIVE=all agents.
-- In PROBE/ACTIVE mode: probe_agent, js_agent, api_agent, disclosure_agent MUST all run eventually.
+- In PROBE/ACTIVE mode: probe_agent, js_agent, api_agent, disclosure_agent, wordpress_enum_agent, wordpress_agent, salesforce_agent MUST all run eventually.
 - When replanning: you may reorder agents but never permanently drop probe agents.
 - If critical findings exist, prioritize agents that reveal blast radius and attack chains.
 - Think: "Given what I found, what do I need to run next to understand the full risk?"
@@ -477,10 +477,13 @@ def _should_run_dropped(dropped: list[str], findings: list[Finding],
     ])
 
     agent_purposes = {
-        "probe_agent":       "Tests endpoints for auth bypass, IDOR, rate limiting, method tampering",
-        "js_agent":          "Analyzes JavaScript for secrets, hidden endpoints, source map exposure",
-        "api_agent":         "Tests GraphQL introspection, Swagger exposure, API auth weaknesses",
-        "disclosure_agent":  "Checks for sensitive file exposure, stack traces, debug endpoints, directory listing",
+        "probe_agent":            "Tests endpoints for auth bypass, IDOR, rate limiting, method tampering",
+        "js_agent":               "Analyzes JavaScript for secrets, hidden endpoints, source map exposure",
+        "api_agent":              "Tests GraphQL introspection, Swagger exposure, API auth weaknesses",
+        "disclosure_agent":       "Checks for sensitive file exposure, stack traces, debug endpoints, directory listing",
+        "wordpress_enum_agent":   "WordPress path enumeration: author username disclosure, xmlrpc.php, wp-cron.php, sitemap, robots.txt",
+        "wordpress_agent":        "WordPress REST API: user enumeration via /wp-json/wp/v2/users, content exposure via posts/pages, 429-aware retry",
+        "salesforce_agent":       "Salesforce Experience Cloud: /services/data/ version probe, /services/apexrest/ exposure, guest user access, community page enumeration",
     }
 
     dropped_desc = "\n".join([
