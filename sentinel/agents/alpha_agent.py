@@ -353,7 +353,6 @@ class AlphaAgent:
                     "blast_radius_estimate": "UNKNOWN — not yet probed",
                 }
                 # Run through scoring engine — same path as LLM-generated decisions
-                from sentinel.core.scoring import calibrate_ai_decision
                 decision = calibrate_ai_decision(
                     decision,
                     confirmed_count=len(self.confirmed_evidence),
