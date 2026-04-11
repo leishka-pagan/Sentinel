@@ -79,7 +79,12 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
         queue = list(plan.get("agents_to_run", _default_agents(session, source_path)))
         print(f"[ORCHESTRATOR] Plan: {queue} | {plan.get('rationale','')}")
 
-    while queue and iteration < MAX_ITERATIONS:
+    # Dynamic ceiling: cover the full initial queue plus buffer for replan additions.
+    # MAX_ITERATIONS = 5 was too low for a 12-agent PROBE suite — agents at positions
+    # 6-12 could never dispatch. Buffer of 10 covers reasonable replan additions.
+    max_iterations = len(queue) + 10
+
+    while queue and iteration < max_iterations:
         iteration += 1
         agent = queue.pop(0)
         if agent in done:
