@@ -50,6 +50,10 @@ class AgentName(str, Enum):
     AUTH_SCAN    = "auth_scan_agent"
     AGGREGATOR   = "aggregator"
     REPORTER     = "reporter"
+    # Tier 1 agents — wired in orchestrator at Step 4
+    WORDPRESS    = "wordpress_agent"
+    SALESFORCE   = "salesforce_agent"
+    WP_ENUM      = "wordpress_enum_agent"
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
