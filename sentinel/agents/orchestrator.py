@@ -283,6 +283,18 @@ def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> l
             from sentinel.agents.auth_scan_agent import run_auth_scan_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
             return run_auth_scan_agent(session, url)
+        elif agent == "wordpress_enum_agent":
+            from sentinel.agents.wordpress_enum_agent import run_wordpress_enum_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_wordpress_enum_agent(session, url)
+        elif agent == "wordpress_agent":
+            from sentinel.agents.wordpress_agent import run_wordpress_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_wordpress_agent(session, url)
+        elif agent == "salesforce_agent":
+            from sentinel.agents.salesforce_agent import run_salesforce_agent
+            url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            return run_salesforce_agent(session, url)
         else:
             return []
     except Exception as e:
@@ -336,11 +348,13 @@ def _default_agents(session: ScanSession, source_path: Optional[str]) -> list[st
     elif session.mode == ScanMode.PROBE:
         return ["recon_agent", "config_agent", "network_agent",
                 "probe_agent", "js_agent", "api_agent", "disclosure_agent",
-                "injection_agent", "auth_scan_agent"]
+                "injection_agent", "auth_scan_agent", "wordpress_enum_agent",
+                "wordpress_agent", "salesforce_agent"]
     elif session.mode == ScanMode.ACTIVE:
         agents = ["recon_agent", "config_agent", "network_agent",
                   "probe_agent", "js_agent", "api_agent", "disclosure_agent",
-                  "injection_agent", "auth_scan_agent"]
+                  "injection_agent", "auth_scan_agent", "wordpress_enum_agent",
+                  "wordpress_agent", "salesforce_agent"]
         if source_path: agents += ["sast_agent", "deps_agent", "logic_agent"]
         agents.append("nuclei_agent")
         return agents
