@@ -143,7 +143,7 @@ def _check_search_injection(base: str, session: ScanSession,
             if auth and auth.logged_in:
                 resp = auth.get(url)
             else:
-                resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+                resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
             if not resp or resp.status_code not in (200, 400, 500, 503):
                 continue
@@ -177,35 +177,43 @@ def _check_search_injection(base: str, session: ScanSession,
                     break
 
             # Check if response differs significantly from normal
-            # (behavioral injection detection)
+            # Behavioral injection detection — requires strong signal, not just size noise
             normal_url = base + endpoint + "apple"
             try:
                 if auth and auth.logged_in:
                     normal_resp = auth.get(normal_url)
                 else:
-                    normal_resp = requests.get(normal_url, headers=HEADERS,
-                                              timeout=TIMEOUT, verify=False)
+                    normal_resp = safe_request("GET", normal_url, headers=HEADERS, timeout=TIMEOUT)
 
-                if normal_resp and abs(len(resp.content) - len(normal_resp.content)) > 500:
-                    findings.append(Finding(
-                        agent=AgentName.INJECTION,
-                        title=f"Injection Behavioral Anomaly: {endpoint.split('?')[0]}",
-                        description=(
-                            f"Response size differs significantly between normal input "
-                            f"({len(normal_resp.content)} bytes) and probe input "
-                            f"({len(resp.content)} bytes) at {endpoint.split('?')[0]}. "
-                            "This behavioral difference may indicate injection vulnerability."
-                        ),
-                        severity=Severity.HIGH,
-                        file_path=url,
-                        cve_id="CWE-89",
-                        mitre_tactic="Initial Access",
-                        mitre_technique="T1190 — Exploit Public-Facing Application",
-                        remediation=(
-                            "Investigate why response sizes differ. "
-                            "Implement parameterized queries and input validation."
-                        ),
-                    ))
+                if normal_resp:
+                    size_probe  = len(resp.content)
+                    size_normal = len(normal_resp.content)
+                    # Require: >3x difference AND both responses are JSON
+                    # >500 byte diff alone is not sufficient — it's noise for dynamic endpoints
+                    is_json_both = ("json" in resp.headers.get("Content-Type","") and
+                                    "json" in normal_resp.headers.get("Content-Type",""))
+                    size_ratio = max(size_probe, size_normal) / max(min(size_probe, size_normal), 1)
+                    if is_json_both and size_ratio > 3.0 and abs(size_probe - size_normal) > 1000:
+                        findings.append(Finding(
+                            agent=AgentName.INJECTION,
+                            title=f"Injection Behavioral Anomaly: {endpoint.split('?')[0]}",
+                            description=(
+                                f"JSON response size differs {size_ratio:.1f}x between normal input "
+                                f"({size_normal} bytes) and probe input "
+                                f"({size_probe} bytes) at {endpoint.split('?')[0]}. "
+                                "Warrants manual verification — may indicate injection condition. "
+                                "Not confirmed without SQL error pattern match."
+                            ),
+                            severity=Severity.MEDIUM,
+                            file_path=url,
+                            cve_id="CWE-89",
+                            mitre_tactic="Initial Access",
+                            mitre_technique="T1190 — Exploit Public-Facing Application",
+                            remediation=(
+                                "Manually verify: send the probe character and inspect the query. "
+                                "Implement parameterized queries and input validation."
+                            ),
+                        ))
             except Exception:
                 pass
 
@@ -225,12 +233,11 @@ def _check_login_injection(base: str, session: ScanSession) -> list[Finding]:
         url = base + endpoint
         try:
             # Send probe character in email field
-            resp = requests.post(
-                url,
-                json={"email": f"test{PROBE_CHAR}@test.com", "password": "test"},
+            resp = safe_request(
+                "POST", url,
                 headers={**HEADERS, "Content-Type": "application/json"},
                 timeout=TIMEOUT,
-                verify=False,
+                json={"email": f"test{PROBE_CHAR}@test.com", "password": "test"},
             )
 
             if resp.status_code not in (200, 400, 401, 500):
@@ -288,7 +295,7 @@ def _check_api_injection(base: str, session: ScanSession,
             if auth and auth.logged_in:
                 resp = auth.get(url)
             else:
-                resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+                resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
             if not resp:
                 continue
@@ -343,7 +350,7 @@ def _check_xss_reflection(base: str, session: ScanSession,
             if auth and auth.logged_in:
                 resp = auth.get(url)
             else:
-                resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+                resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
             if not resp or resp.status_code != 200:
                 continue

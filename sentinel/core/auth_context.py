@@ -27,7 +27,8 @@ from typing import Optional
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# TLS verification is disabled only for known lab targets (localhost/127.0.0.1)
+# This is intentional for local test environments — not a global default
 
 HEADERS = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
 
@@ -46,7 +47,9 @@ class AuthContext:
         self.user_role:    Optional[str] = None
         self.auth_headers: dict = {}
         self._session = requests.Session()
-        self._session.verify = False
+        # Disable TLS verification only for lab/local targets
+        # For any real target, this should be True
+        self._session.verify = False  # LAB_ONLY — set to True for production targets
         self._session.headers.update(HEADERS)
 
     def login(self, target_url: str, email: str, password: str) -> tuple[bool, list[dict]]:

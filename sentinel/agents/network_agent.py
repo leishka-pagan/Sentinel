@@ -10,7 +10,7 @@ Analyzes:
   - Network segmentation gaps
   - DNS exposure and subdomain enumeration
 
-SCOPE: PASSIVE and ACTIVE modes.
+SCOPE: PASSIVE, PROBE, and ACTIVE modes.
 ACTIONS: dns_lookup, http_headers, port_scan_passive, port_scan_active, subfinder_scan
 NEVER: exploits, modifies network config, sends payloads
 """

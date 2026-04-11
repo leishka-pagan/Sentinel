@@ -49,40 +49,38 @@ class AttackChain:
 CHAIN_SYSTEM_PROMPT = """You are Sentinel's Attack Chain Analyst — a senior red team thinker
 working for the blue team.
 
-Your job: Given a set of vulnerability findings, identify combinations that form
-viable attack chains. Think like an attacker who will combine multiple weaknesses
-to achieve a goal.
+Your job: Given CONFIRMED vulnerability findings, identify multi-step attack paths where
+one finding enables or escalates another. Think: what can an attacker DO with these findings
+in combination that they CANNOT do with either alone?
 
 Rules:
-- Only identify chains that are PLAUSIBLE given the findings — don't speculate wildly
-- A chain needs at least 2 connected findings to be valid
-- Rank chains by actual exploitability + impact, not just individual severity
-- Be specific about the attack path — generic "attacker gains access" is useless
-- Blast radius must be concrete — "database contents" not "data breach"
-- Remediation must identify the ONE finding that, if fixed, breaks the entire chain
-- Confidence: HIGH = direct connection between findings, MEDIUM = plausible combination,
-  LOW = theoretical but worth noting
+- A chain MUST have at least 2 DIFFERENT findings — a finding cannot chain with itself
+- Each step must ESCALATE capability: access → privilege, exposure → extraction, recon → exploit
+- Generic "attacker gains access" steps are useless — be specific about what changes at each step
+- Blast radius must be measured data — cite record counts, endpoint names, specific data types
+- Confidence: HIGH = direct proven connection, MEDIUM = plausible combination, LOW = theoretical
+- If the only confirmed findings are two separate API exposures at same privilege level, they do NOT
+  form a chain — they are parallel findings. Only return a chain if one genuinely enables the other.
+- Remediation must identify the ONE fix that breaks the chain — not a list of general improvements
 
-Output ONLY a valid JSON array of chain objects. No preamble, no markdown fences.
+Output ONLY a valid JSON array. If no real chains exist, return: []
 
 Each chain object:
 {
   "chain_id": "CHAIN-001",
-  "title": "Short descriptive title of the attack path",
+  "title": "Specific: Finding A enables Finding B",
   "severity": "CRITICAL|HIGH|MEDIUM",
-  "description": "What this chain represents in plain English",
+  "description": "What this chain enables that neither finding alone provides",
   "attack_path": [
-    "Step 1: Attacker does X using finding Y",
-    "Step 2: Using access from step 1, attacker does Z",
-    "Step 3: Attacker reaches final objective"
+    "Step 1: Using [specific confirmed finding], attacker obtains [specific capability]",
+    "Step 2: That capability enables [specific next action] via [specific mechanism]",
+    "Step 3: Final objective: [concrete impact with measured data]"
   ],
-  "blast_radius": "Concrete description of what attacker can access/do",
+  "blast_radius": "Measured: cite exact record counts, endpoint names, or data types confirmed",
   "finding_ids": ["finding-id-1", "finding-id-2"],
   "remediation_priority": "Fix [specific finding] first — this breaks the chain at step X",
   "confidence": "HIGH|MEDIUM|LOW"
 }
-
-If no meaningful chains exist, return an empty array: []
 """
 
 
@@ -95,29 +93,46 @@ def analyze_attack_chains(result: ScanResult) -> list[AttackChain]:
     if result.total == 0:
         return []
 
-    # Only chain findings that are CONFIRMED or at minimum INFERRED
-    # UNCONFIRMED hypotheses cannot form attack chains — that's assumption stacking
+    # Get confirmed URLs from session_intel — the authoritative source
+    # NOT a heuristic — only findings that passed the pipeline
+    session = getattr(result, '_session', None)
+    intel = getattr(session, '_session_intel', None) if session else None
+
+    confirmed_urls: set = set()
+    if intel:
+        confirmed_urls = intel.confirmed_urls
+
+    # Build confirmed and inferred lists
+    # CONFIRMED: URL appears in session_intel confirmed_urls
+    # INFERRED: everything else (cannot anchor a chain)
     meaningful = [
         f for f in result.findings
         if f.severity not in (Severity.INFO,)
-        and not f.title.startswith("[UNCONFIRMED]")
     ]
-    # Tag which findings are confirmed vs inferred for Claude
-    confirmed   = [f for f in meaningful if "blast radius (measured)" in (f.description or "").lower()
-                   or f.title.startswith("[Alpha] Unauthenticated")
-                   or f.agent in ("probe_agent", "config_agent", "recon_agent",
-                                  "injection_agent", "auth_scan_agent")]
-    inferred    = [f for f in meaningful if f not in confirmed]
+
+    confirmed = [f for f in meaningful
+                 if f.file_path and f.file_path in confirmed_urls]
+    inferred  = [f for f in meaningful if f not in confirmed]
+
     print(f"[CHAIN] Confirmed findings: {len(confirmed)} | Inferred: {len(inferred)}")
 
-    if len(meaningful) < 2:
-        return []  # Can't form a chain with 1 finding
+    # Hard rule: chains require at least 2 CONFIRMED findings
+    # If we have fewer, return empty — no chains allowed
+    if len(confirmed) < 2:
+        print(f"[CHAIN] Insufficient confirmed findings ({len(confirmed)}) — no chains built")
+        return []
 
-    print(f"[CHAIN] Analyzing {len(meaningful)} findings for attack chains...")
+    print(f"[CHAIN] Analyzing {len(confirmed)} confirmed findings for chains...")
 
-    findings_json = _serialize_findings_with_status(confirmed, inferred)
+    # ONLY confirmed findings go to Claude — inferred are context only if needed
+    # This prevents Claude from inventing chains from unverified signals
+    findings_json = _serialize_findings_with_status(confirmed, [])  # Empty inferred list
     raw_chains    = _call_claude(result.target, result.mode, findings_json)
     chains        = _parse_chains(raw_chains)
+
+    # Hard cap: cannot have more chains than confirmed findings
+    if len(chains) > len(confirmed):
+        chains = chains[:len(confirmed)]
 
     print(f"[CHAIN] Identified {len(chains)} attack chains")
     return chains
@@ -143,8 +158,9 @@ def _serialize_findings(findings: list[Finding]) -> str:
 def _serialize_findings_with_status(confirmed: list[Finding],
                                      inferred: list[Finding]) -> str:
     """
-    Serialize findings with explicit confirmation status.
-    Claude must not chain INFERRED findings as if they were CONFIRMED.
+    Serialize CONFIRMED findings for Claude chain analysis.
+    Inferred parameter kept for API compatibility but is never used —
+    only confirmed findings can anchor chains.
     """
     items = []
     for f in confirmed:
@@ -157,15 +173,7 @@ def _serialize_findings_with_status(confirmed: list[Finding],
             "agent":       f.agent,
             "mitre":       f.mitre_tactic,
         })
-    for f in inferred:
-        items.append({
-            "id":          f.finding_id,
-            "status":      "INFERRED — not directly confirmed",
-            "severity":    f.severity,
-            "title":       f.title,
-            "description": (f.description or "")[:200],
-            "agent":       f.agent,
-        })
+    # inferred findings are intentionally excluded — they cannot anchor chains
     return json.dumps(items, indent=2, default=str)
 
 

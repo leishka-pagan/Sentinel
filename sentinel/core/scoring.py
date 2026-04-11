@@ -396,13 +396,34 @@ def calibrate_confidence(ai_confidence: float,
     if cvss_score and status == FindingStatus.OBSERVED:
         base = 0.20 + (cvss_score / 10.0) * 0.65
     elif status == FindingStatus.INFERRED:
-        # INFERRED: we have indirect evidence — start higher than UNCONFIRMED
-        base = 0.40 + evidence_sum
+        # INFERRED: 0.30-0.50 range (strictly)
+        base = max(0.30, min(0.50, 0.40 + evidence_sum))
+    elif status == FindingStatus.OBSERVED and verification == VerificationResult.INCONCLUSIVE:
+        # OBSERVED but inconclusive: 0.35-0.55 range
+        base = max(0.35, min(0.55, 0.45 + evidence_sum))
     else:
-        base = 0.25 + evidence_sum
+        # UNCONFIRMED: 0.05-0.35 range (strictly)
+        base = max(0.05, min(0.35, 0.25 + evidence_sum))
 
     calibrated = min(base, ceiling)
     calibrated = max(0.05, round(calibrated, 2))
+
+    # Enforce deterministic ranges — no AI discretion
+    if verification == VerificationResult.REFUTED:
+        # REFUTED: confidence is 0.0 — proven not vulnerable
+        calibrated = 0.0
+    elif status == FindingStatus.OBSERVED and verification == VerificationResult.CONFIRMED:
+        # CONFIRMED + strong evidence: 0.85-0.95
+        calibrated = max(0.85, min(0.95, calibrated))
+    elif status == FindingStatus.INFERRED:
+        # INFERRED: 0.30-0.50
+        calibrated = max(0.30, min(0.50, calibrated))
+    elif verification == VerificationResult.INCONCLUSIVE:
+        # INCONCLUSIVE: hard cap 0.40
+        calibrated = min(0.40, calibrated)
+    elif status == FindingStatus.UNCONFIRMED:
+        # UNCONFIRMED: hard cap 0.35
+        calibrated = min(0.35, calibrated)
 
     delta = round(ai_confidence - calibrated, 2)
     return calibrated, delta
@@ -499,8 +520,10 @@ def score_alpha_hypothesis(statement: str, ai_confidence: float,
     if delta > 0.20:
         result["calibration_note"] = (
             f"AI claimed {ai_confidence:.2f}, evidence supports {calibrated:.2f} "
-            f"(status: {status.value}). Adjusted."
+            f"(status: {status.value}). Adjusted down."
         )
+        # Track on session for eval harness
+        # (accessed via session._eval_harness if available)
 
     return result
 
@@ -541,6 +564,14 @@ def calibrate_ai_decision(decision: dict,
 
     if scored["hallucination_detected"]:
         decision["hypothesis"]["calibration_note"] = scored["calibration_note"]
+        # Auto-report to eval_harness via module-level reference
+        try:
+            import sentinel.agents._eval_ref as _eref
+            harness = getattr(_eref, 'current_harness', None)
+            if harness:
+                harness.record_hallucination_blocked(scored.get("delta", 0.0))
+        except Exception:
+            pass  # Eval harness not available — not a scan-breaking error
 
     return decision
 

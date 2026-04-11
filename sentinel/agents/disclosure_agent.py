@@ -18,9 +18,8 @@ NEVER: exploits errors, injects payloads, modifies data
 """
 
 import re
-import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+import requests  # for RequestException type only
+from sentinel.core.evidence import safe_request
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity,
@@ -162,8 +161,7 @@ def _check_sensitive_files(base: str, session: ScanSession) -> list[Finding]:
     for path, label, severity in SENSITIVE_FILES:
         url = base + path
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
 
             if resp.status_code == 200 and len(resp.content) > 0:
                 content_preview = resp.text[:200].strip()
@@ -206,8 +204,7 @@ def _check_error_disclosure(base: str, session: ScanSession) -> list[Finding]:
     for path in ERROR_TRIGGER_PATHS:
         url = base + path
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
 
             if resp.status_code not in (400, 404, 500, 503):
                 continue
@@ -279,8 +276,7 @@ def _check_directory_listing(base: str, session: ScanSession) -> list[Finding]:
     for path in dirs_to_check:
         url = base + path
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
 
             if resp.status_code != 200:
                 continue
@@ -343,8 +339,7 @@ def _check_debug_endpoints(base: str, session: ScanSession) -> list[Finding]:
     for path, label in debug_paths:
         url = base + path
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
 
             if resp.status_code == 200 and len(resp.content) > 50:
                 findings.append(Finding(

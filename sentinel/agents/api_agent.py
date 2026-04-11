@@ -18,9 +18,8 @@ NEVER: mutates data, sends malicious payloads, exploits
 
 import json
 import re
-import requests
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+import requests  # for RequestException type only
+from sentinel.core.evidence import safe_request
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity,
@@ -81,13 +80,7 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
 
         # Check if GraphQL endpoint exists
         try:
-            resp = requests.post(
-                url,
-                json=INTROSPECTION_CHECK,
-                headers={**HEADERS, "Content-Type": "application/json"},
-                timeout=TIMEOUT,
-                verify=False,
-            )
+            resp = safe_request("POST", url, headers={**HEADERS, "Content-Type": "application/json"}, timeout=TIMEOUT, json=INTROSPECTION_CHECK)
 
             if resp.status_code not in (200, 400):
                 continue
@@ -120,13 +113,7 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
                 ))
 
                 # Now test full introspection
-                intro_resp = requests.post(
-                    url,
-                    json=INTROSPECTION_QUERY,
-                    headers={**HEADERS, "Content-Type": "application/json"},
-                    timeout=TIMEOUT,
-                    verify=False,
-                )
+                intro_resp = safe_request("POST", url, headers={**HEADERS, "Content-Type": "application/json"}, timeout=TIMEOUT, json=INTROSPECTION_QUERY)
 
                 if intro_resp.status_code == 200:
                     try:
@@ -173,8 +160,7 @@ def _check_api_docs(base: str, session: ScanSession) -> list[Finding]:
     for path in API_DOC_PATHS:
         url = base + path
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
 
             if resp.status_code != 200:
                 continue
@@ -243,8 +229,7 @@ def _check_api_versioning(base: str, session: ScanSession) -> list[Finding]:
         for path in paths:
             url = base + path
             try:
-                resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                    verify=False, allow_redirects=False)
+                resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
                 if resp.status_code in (200, 401, 403):
                     accessible_versions.append(version)
                     break
@@ -285,8 +270,7 @@ def _check_api_auth_headers(base: str, session: ScanSession) -> list[Finding]:
     for path in test_paths:
         url = base + path
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
 
             if resp.status_code not in (200, 401, 403):
                 continue

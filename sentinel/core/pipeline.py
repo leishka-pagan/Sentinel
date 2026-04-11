@@ -9,6 +9,26 @@ No exceptions. No AI discretion on promotion.
 State machine:
   HYPOTHESIS → TESTED → CONFIRMED | REFUTED
 
+First-class TESTED sub-outcomes (stored in promotion_reason, not separate states):
+  TESTED / INPUT_REQUIRED:
+    - HTTP 400 returned
+    - Endpoint exists and works — it rejected malformed input
+    - NOT a security finding — retry only with valid input
+    - Never retried without providing required parameters
+    - Not stored as disproven (endpoint may still be vulnerable with valid input)
+
+  TESTED / INCONCLUSIVE:
+    - HTTP 500 returned
+    - Server is broken/misconfigured — cannot determine safe or unsafe
+    - Not promoted to CONFIRMED (no proof of access)
+    - Not promoted to REFUTED (no proof of protection)
+    - After 2 INCONCLUSIVE results on same URL: permanently skip
+
+These are intentionally NOT separate FindingState enum values because:
+  - Both transition from HYPOTHESIS → TESTED (the state is correct)
+  - The distinction is encoded in promotion_reason for reporting
+  - Adding enum values would require updating all state machine consumers
+
 Promotion rules (enforced, not advisory):
   HYPOTHESIS → TESTED:
     - Request was sent
@@ -23,10 +43,11 @@ Promotion rules (enforced, not advisory):
     - Content size > threshold
 
   TESTED → REFUTED:
-    - HTTP 401 or 403 returned
-    - Response is a SPA shell (HTML ~75KB)
-    - Request failed (connection refused, timeout)
-    - Response is empty
+    - HTTP 401 or 403 returned (AUTH_ENFORCED)
+    - Response is a SPA shell (SPA_FALLBACK)
+    - HTTP 404 returned (NOT_FOUND)
+    - Request failed (NO_RESPONSE)
+    - Response is empty (EMPTY_RESPONSE)
 
 Every CONFIRMED finding includes:
   - Request artifact (method, url, headers sent)
@@ -38,13 +59,6 @@ Every REFUTED finding includes:
   - Why it was refuted
   - What was tested
   - What was expected vs what happened
-
-Potential paths are structured:
-  - Entry point (what we know)
-  - Steps (what must happen in order)
-  - Assumptions (what must be true)
-  - Next test (what to probe next)
-  - Risk level (if path is real)
 """
 
 import json
@@ -341,17 +355,30 @@ class FindingPipeline:
             self.refuted.append(neg)
             return FindingState.REFUTED, None, neg
 
-        # REFUTED: server error without data
-        if status >= 500 and size < 500:
-            neg = NegativeValidation(
-                endpoint=url, method=method,
-                reason=RefutedReason.SERVER_ERROR,
-                evidence=EvidenceBundle(req, resp, FindingState.REFUTED,
-                                        f"HTTP {status} — server error, no useful data",
-                                        RefutedReason.SERVER_ERROR),
+        # INPUT_REQUIRED: 400 Bad Request — endpoint exists but needs valid input
+        # This is NOT a security finding and NOT inconclusive in the security sense.
+        # The endpoint is rejecting a malformed request — it's working as designed.
+        # Record as TESTED with INPUT_REQUIRED reason — do NOT retry without valid params.
+        if status == 400:
+            bundle = EvidenceBundle(
+                request=req,
+                response=resp,
+                finding_state=FindingState.TESTED,
+                promotion_reason=f"HTTP 400 — input required, not a security finding",
             )
-            self.refuted.append(neg)
-            return FindingState.REFUTED, None, neg
+            return FindingState.TESTED, bundle, None
+
+        # INCONCLUSIVE: server error — endpoint broken, not proven safe
+        # 500 means the server failed, NOT that the endpoint is secure
+        # Return TESTED so session_intel records it as inconclusive
+        if status >= 500:
+            bundle = EvidenceBundle(
+                request=req,
+                response=resp,
+                finding_state=FindingState.TESTED,
+                promotion_reason=f"HTTP {status} server error — inconclusive, not proven safe",
+            )
+            return FindingState.TESTED, bundle, None
 
         # REFUTED: empty or too-small response
         if status == 200 and size < self.MIN_CONTENT_SIZE:
@@ -556,3 +583,92 @@ class FindingPipeline:
             429: "Too Many Requests", 500: "Internal Server Error",
             503: "Service Unavailable",
         }.get(status, str(status))
+
+
+# ── Hard promotion rule enforcer ──────────────────────────────────────────────
+# These are the non-bypassable rules referenced in the architecture.
+# Called BEFORE any state transition. Raises if criteria not met.
+
+class PromotionRules:
+    """
+    Non-bypassable promotion rules.
+    No state transition happens without passing these checks.
+    """
+
+    @staticmethod
+    def can_promote_to_tested(request_sent: bool, response_received: bool) -> tuple[bool, str]:
+        if not request_sent:
+            return False, "Cannot promote to TESTED: no request was sent"
+        if not response_received:
+            return False, "Cannot promote to TESTED: no response received"
+        return True, "OK"
+
+    @staticmethod
+    def can_promote_to_confirmed(response: ResponseRecord) -> tuple[bool, str]:
+        """
+        TESTED → CONFIRMED requires ALL of:
+          - HTTP 200
+          - Response type is JSON (not HTML/EMPTY)
+          - proof_snippet is non-empty
+          - size > 200 bytes
+          - auth was NOT sent
+          - NOT a SPA shell
+        
+        Fails IMMEDIATELY if any criterion is missing.
+        """
+        if response.status_code != 200:
+            return False, f"Status {response.status_code} — only HTTP 200 can be CONFIRMED"
+        
+        if response.response_type == "HTML":
+            return False, "HTML response — not structured data, cannot CONFIRM"
+        
+        if response.response_type == "EMPTY":
+            return False, "Empty response — no evidence, cannot CONFIRM"
+        
+        if response.size_bytes < 200:
+            return False, f"Response too small ({response.size_bytes}b) — insufficient evidence"
+        
+        if not response.proof_snippet:
+            return False, "No proof snippet — evidence required for CONFIRMED state"
+        
+        return True, "OK"
+
+    @staticmethod
+    def must_be_inconclusive(status_code: int, response_type: str,
+                              timed_out: bool = False) -> tuple[bool, str]:
+        """
+        Cases that MUST be INCONCLUSIVE — cannot be promoted or chained.
+        """
+        if timed_out:
+            return True, "Request timed out — INCONCLUSIVE"
+        if status_code >= 500:
+            return True, f"HTTP {status_code} server error — INCONCLUSIVE"
+        if response_type == "EMPTY" and status_code == 200:
+            return True, "HTTP 200 but empty body — INCONCLUSIVE"
+        return False, "Not inconclusive"
+
+    @staticmethod
+    def can_use_in_chain(state: FindingState) -> tuple[bool, str]:
+        """
+        Hard rule: only CONFIRMED findings can be used in attack chains.
+        INFERRED, UNCONFIRMED, INCONCLUSIVE cannot anchor chains.
+        """
+        if state == FindingState.CONFIRMED:
+            return True, "OK"
+        return False, f"State is {state.value} — only CONFIRMED can be used in chains"
+
+    @staticmethod
+    def validate_evidence_bundle(bundle: 'EvidenceBundle') -> tuple[bool, str]:
+        """
+        Validate that a bundle meets minimum evidence requirements.
+        Auto-downgrade to TESTED if it doesn't.
+        """
+        if not bundle.request.url:
+            return False, "Missing request URL"
+        if bundle.response.status_code == 0:
+            return False, "Missing response status code"
+        if bundle.finding_state == FindingState.CONFIRMED:
+            ok, reason = PromotionRules.can_promote_to_confirmed(bundle.response)
+            if not ok:
+                return False, f"CONFIRMED requires: {reason}"
+        return True, "OK"

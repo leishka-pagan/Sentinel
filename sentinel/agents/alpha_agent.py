@@ -28,7 +28,8 @@ from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, Severity,
 )
 from sentinel.core.evidence import probe_with_evidence, EvidenceArtifact
-from sentinel.core.pipeline import FindingPipeline, FindingState, NegativeValidation
+from sentinel.core.pipeline import FindingPipeline, FindingState, NegativeValidation, PromotionRules
+from sentinel.core.session_intelligence import SessionIntelligence, ProbeOutcome, DisproveReason
 from sentinel.core.scoring import (
     score_finding, calibrate_ai_decision,
     FindingStatus, VerificationResult, honest_blast_radius,
@@ -40,7 +41,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 ALPHA_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-5-20251001")
 FALLBACK_MODEL = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
-MAX_ALPHA_CYCLES = 10
+MAX_ALPHA_CYCLES = 6
 MIN_FINDINGS     = 2
 BLOCKED_METHODS  = {"DELETE", "PUT", "PATCH"}
 
@@ -96,9 +97,9 @@ class AlphaReport:
     confirmed_paths:   list[dict]
 
 
-ALPHA_SYSTEM = """You are Sentinel Alpha v2 — elite autonomous threat investigator.
+ALPHA_SYSTEM = """You are Sentinel Alpha v2 — autonomous threat investigator.
 
-HYPOTHESIS SCORING — evidence-based only, no assertion:
+HYPOTHESIS SCORING — evidence-based only:
   Your confidence claim will be CALIBRATED against measurable evidence.
   A system will check your score against what was actually observed.
   If you claim 0.9 but evidence only supports 0.4, your score becomes 0.4.
@@ -128,28 +129,39 @@ HYPOTHESIS SCORING — evidence-based only, no assertion:
   impact_value: CRITICAL=4, HIGH=3, MEDIUM=2, LOW=1
   cost: requests needed (1=single probe, 3=agent run)
 
-ATTACK GRAPH: Every finding enables something.
-  Unauthenticated endpoint -> data theft, enumeration, admin access
-  No rate limiting -> credential stuffing, brute force
-  SQL condition -> auth bypass, data extraction
-  Build the graph. Find all paths to maximum impact.
+LANGUAGE RULES — violations will be flagged:
+  FORBIDDEN words unless you have multiple confirmed endpoints in the SAME family:
+  - "systematic", "systemic", "across the board", "pattern of"
+  - "layer lacks", "consistently lacks", "universally"
+  One confirmed endpoint = one data point. State it as one data point.
+  
+  FORBIDDEN blast radius claims unless you measured it:
+  - Any number: "100+", "1000+", "hundreds of", "thousands of"
+  - Any range estimate: "potentially X to Y records"
+  - Any scope claim: "all users", "all accounts", "entire database"
+  
+  ALLOWED blast radius:
+  - "MEASURED: N records returned" (only after actual probe)
+  - "UNKNOWN — not yet probed"
+  - "UNKNOWN — endpoint returned no data"
 
-BLAST RADIUS: For every CRITICAL finding, estimate:
-  How many records? What data types? Worst-case damage?
+ATTACK GRAPH: Every confirmed finding enables something.
+  Unauthenticated endpoint → probe sibling endpoints, test IDOR
+  No rate limiting → note as chain candidate (do not claim brute force without testing)
+  SQL condition → Boolean differential probe
+  Follow the chain. Do not invent paths not supported by evidence.
 
 SELF-CORRECTION: Learn from every result.
   Track patterns. Apply them forward.
-  "lowercase /api/ fails -> try capitalized"
-
-THREAT ACTORS: Match findings to TTPs.
-  Unauthenticated admin + no rate limit = ransomware profile
-  JWT weakness + API enum = credential theft actor
+  "lowercase /api/ fails → try capitalized"
 
 HARD RULES:
   - Never suggest exploitation
   - Only GET, POST, OPTIONS, HEAD in targeted probes
-  - Never retry DELETE/PUT/PATCH — they are permanently blocked
+  - Never retry DELETE/PUT/PATCH — permanently blocked
   - Never fabricate findings
+  - Never claim "systematic" from a single data point
+  - Never estimate blast radius without a measured probe
 
 OUTPUT FORMAT — valid JSON only:
 
@@ -161,19 +173,16 @@ Investigating:
   "learned_patterns": ["pattern learned"],
   "primary_path": {"action": "targeted_probe|run_agent", "agent": "name", "probe": {"url": "...", "method": "GET"}, "rationale": "why"},
   "fallback_path": {"action": "targeted_probe", "probe": {"url": "...", "method": "GET"}, "rationale": "why"},
-  "fallback_path_2": {"action": "targeted_probe", "probe": {"url": "...", "method": "GET"}, "rationale": "why"},
-  "blast_radius_estimate": "X records, Y data types"
+  "blast_radius_estimate": "UNKNOWN — not yet probed"
 }
 
 Concluding:
 {
   "cycle": N,
   "status": "complete",
-  "threat_narrative": "complete picture",
-  "attack_paths": [{"path_id": "PATH-001", "title": "...", "severity": "CRITICAL", "steps": [], "confirmed": true, "blast_radius": "...", "break_point": "...", "exploit_probability": 0.95, "threat_actors": []}],
+  "threat_narrative": "factual summary of what was confirmed — no speculation",
+  "attack_paths": [{"path_id": "PATH-001", "title": "...", "severity": "CRITICAL", "steps": [], "confirmed": true, "blast_radius": "MEASURED: N records or UNKNOWN", "break_point": "...", "exploit_probability": 0.95, "threat_actors": []}],
   "defensive_gaps": [{"finding": "...", "missing_controls": ["control1", "control2"]}],
-  "exploit_probability_summary": [{"finding": "...", "probability": 0.95, "rationale": "..."}],
-  "threat_actor_profile": "who and how",
   "immediate_actions": ["action1", "action2"],
   "risk_score": "CRITICAL"
 }
@@ -198,6 +207,7 @@ class AlphaAgent:
         self.confirmed_evidence: list[dict] = []  # Probes that returned confirmed data
         self.refuted_paths:    set[str] = set()   # Endpoints confirmed NOT vulnerable
         self.pipeline:         FindingPipeline = FindingPipeline()  # Formal state machine
+        self.session_intel:    Optional[SessionIntelligence] = None  # Shared session memory
         self.defensive_gaps:   list[dict] = []
         self.exploit_probs:    list[dict] = []
         self.threat_actors:    list[str] = []
@@ -223,6 +233,9 @@ class AlphaAgent:
     def think(self) -> dict:
         self.cycle += 1
         print(f"\n[{self.alpha_id}] === Cycle {self.cycle} ===")
+        intel = getattr(self.session, '_session_intel', None)
+        if intel:
+            intel.current_cycle = self.cycle
 
         if self.cycle > MAX_ALPHA_CYCLES:
             return self._force_conclusion()
@@ -230,6 +243,126 @@ class AlphaAgent:
         if len(self.all_findings) < MIN_FINDINGS:
             return {"status": "need_more_data", "cycle": self.cycle}
 
+        # ── Code-driven queue consumption ─────────────────────────────────────
+        # Priority tiers — probe in order:
+        #   Tier 1: chain steps (children of confirmed findings)
+        #   Tier 2: high-value JS-discovered endpoints (known API patterns)
+        #   Tier 3: remaining JS-discovered endpoints
+        # Never label a probe "chain-driven" unless it has a confirmed parent.
+        if intel and intel.untested_queue:
+            # Identify which URLs in the queue are true chain steps
+            # (generated by AttackGraph from a confirmed finding)
+            chain_generated    = intel.attack_graph._all_generated    if intel.attack_graph else set()
+            registry_generated = intel.attack_graph._registry_generated if intel.attack_graph else set()
+
+            # Tier 1: confirmed-parent queue siblings (direct chain steps)
+            tier1 = [u for u in intel.untested_queue
+                     if u in chain_generated
+                     and u not in intel.confirmed_urls
+                     and u not in intel.disproven_urls
+                     and intel.inconclusive_counts.get(u, 0) < 2]
+
+            # Tier 1.5: registry-generated siblings (same confidence as chain, different source)
+            tier1b = [u for u in intel.untested_queue
+                      if u in registry_generated
+                      and u not in chain_generated
+                      and u not in intel.confirmed_urls
+                      and u not in intel.disproven_urls
+                      and intel.inconclusive_counts.get(u, 0) < 2]
+
+            # Tier 2: high-value JS-discovered endpoints
+            # These are endpoints known to contain real data in common vulnerable apps
+            HIGH_VALUE = [
+                '/api/Challenges', '/api/Products', '/api/Users',
+                '/api/Feedbacks', '/api/Baskets',
+                '/rest/admin/',
+                '/rest/products/search',
+                '/rest/admin/application-configuration',
+            ]
+            tier2 = [u for u in intel.untested_queue
+                     if u not in chain_generated
+                     and u not in registry_generated
+                     and u not in intel.confirmed_urls
+                     and u not in intel.disproven_urls
+                     and intel.inconclusive_counts.get(u, 0) < 2
+                     and any(hv.lower() in u.lower() for hv in HIGH_VALUE)]
+
+            # Tier 3: remaining queue
+            tier3 = [u for u in intel.untested_queue
+                     if u not in chain_generated
+                     and u not in registry_generated
+                     and u not in intel.confirmed_urls
+                     and u not in intel.disproven_urls
+                     and intel.inconclusive_counts.get(u, 0) < 2
+                     and not any(hv.lower() in u.lower() for hv in HIGH_VALUE)]
+
+            next_url = None
+            probe_label = None
+            if tier1:
+                next_url = tier1[0]
+                probe_label = "Chain-driven"       # Queue sibling of confirmed parent
+            elif tier1b:
+                next_url = tier1b[0]
+                probe_label = "Registry-expanded"  # Registry sibling of confirmed namespace
+            elif tier2:
+                next_url = tier2[0]
+                probe_label = "High-value candidate"
+            elif tier3:
+                next_url = tier3[0]
+                probe_label = "Queued candidate"
+
+            if next_url:
+                intel.untested_queue.remove(next_url)
+                print(f"[{self.alpha_id}] [{probe_label}] → {next_url}")
+
+                # Build decision — go through scoring for real confidence
+                from sentinel.core.scoring import FindingStatus, VerificationResult
+                # All queued URLs are INFERRED/UNTESTED until probe returns evidence
+                # OBSERVED status requires actual HTTP response — never pre-assign it
+                # Confidence tiers are inputs to the scoring engine, not final values
+                if probe_label == "Chain-driven":
+                    base_conf = 0.65
+                elif probe_label == "Registry-expanded":
+                    base_conf = 0.55
+                else:
+                    base_conf = 0.35
+                decision = {
+                    "hypothesis": {
+                        "statement":    f"{probe_label}: probing {next_url}",
+                        "confidence":   base_conf,
+                        "status":       "INFERRED",     # Always INFERRED pre-probe
+                        "verification": "UNTESTED",     # Always UNTESTED pre-probe
+                        "impact":       "HIGH",
+                        "cost":         1,
+                        "score":        round((base_conf * 3) / 1, 2),
+                    },
+                    "primary_path": {
+                        "action":    "targeted_probe",
+                        "probe":     {"url": next_url, "method": "GET"},
+                        "rationale": f"{probe_label} from investigation queue",
+                    },
+                    "learned_patterns":    [],
+                    "status":              "active",
+                    "blast_radius_estimate": "UNKNOWN — not yet probed",
+                }
+                # Run through scoring engine — same path as LLM-generated decisions
+                from sentinel.core.scoring import calibrate_ai_decision
+                decision = calibrate_ai_decision(
+                    decision,
+                    confirmed_count=len(self.confirmed_evidence),
+                )
+                self._process_decision(decision)
+                return decision
+
+        # ── Early exit: queue exhausted, no progress ─────────────────────────
+        if intel and self.cycle > 2:
+            no_recent_progress = len(self.confirmed_evidence) == 0 and self.cycle >= 4
+            if no_recent_progress:
+                print(f"[{self.alpha_id}] Queue exhausted, no confirmed findings — stopping early at cycle {self.cycle}")
+                return {"status": "complete", "cycle": self.cycle,
+                        "report": "Queue exhausted with no confirmed findings."}
+
+        # ── Free hypothesis: queue empty, reason from evidence ────────────────
         try:
             response = client.messages.create(
                 model=self.model,
@@ -238,10 +371,6 @@ class AlphaAgent:
                 messages=[{"role": "user", "content": self._build_prompt()}],
             )
             decision = _parse_json(response.content[0].text.strip())
-            # Calibrate AI scores against measurable evidence
-            # This prevents hallucinated confidence values
-            # Pass confirmed evidence count to calibration
-            # More confirmed findings = higher ceiling for confidence
             n_confirmed = len(self.confirmed_evidence)
             decision = calibrate_ai_decision(decision, confirmed_count=n_confirmed)
             self._process_decision(decision)
@@ -320,19 +449,19 @@ Write final complete threat assessment. Return complete status JSON."""
             cvss     = hyp.get("cvss_basis")
             vector   = hyp.get("cvss_vector", "")
             # Only show MEASURED blast radius — not AI narrative
-            blast    = hyp.get("blast_radius", "unknown — not yet measured")
-            # Override hallucinated blast radius — only measured values allowed
+            blast    = hyp.get("blast_radius", "UNKNOWN — endpoint not yet probed")
+            # Hard rule: blast radius is MEASURED or UNKNOWN only
+            # Any speculative number or range gets replaced
             hallucination_phrases = [
                 "complete system", "all user", "thousands", "millions", "entire",
                 "all records", "complete database", "complete customer", "all data",
                 "potentially", "complete application", "complete exposure",
                 "full data", "all order", "complete crud", "all account",
+                "1000+", "100+", "500+", "10000", "all admin", "entire user",
+                "all application", "all system",
             ]
             if any(x in str(blast).lower() for x in hallucination_phrases):
-                if self.confirmed_evidence:
-                    blast = f"pending measurement — {len(self.confirmed_evidence)} endpoint(s) confirmed so far"
-                else:
-                    blast = "not yet measured — no confirmed probes this cycle"
+                blast = "UNKNOWN — not yet measured (speculative claim blocked)"
             reliable = hyp.get("score_reliable", True)
             calib    = hyp.get("calibration_note", "")
 
@@ -657,14 +786,40 @@ Write final complete threat assessment. Return complete status JSON."""
         if self.refuted_paths:
             refuted_str = f"\nCONFIRMED PROTECTED (stop probing these): {list(self.refuted_paths)[-5:]}\n"
 
+        # Get shared session intelligence context
+        intel = getattr(self.session, '_session_intel', None)
+        intel_context = intel.get_alpha_context() if intel else "No session intelligence"
+
+        # Get active chain context — chain steps have priority over hypotheses
+        chain_context = ""
+        if intel and intel.attack_graph:
+            chain_context = intel.attack_graph.get_active_chain_context()
+
+        # Get untested endpoints queue from JS discovery
+        untested_queue = ""
+        if intel and intel.untested_queue:
+            untested = [u for u in intel.untested_queue
+                        if u not in intel.confirmed_urls
+                        and u not in intel.disproven_urls
+                        and intel.inconclusive_counts.get(u, 0) < 2]
+            if untested:
+                untested_queue = (
+                    f"\nENDPOINTS TO PROBE — IN ORDER (do not deviate):\n"
+                    f"Chain-driven steps are at the front. Exhaust these before any free hypothesis.\n"
+                )
+                for url in untested[:12]:
+                    untested_queue += f"  → {url}\n"
+
         return f"""Target: {self.session.target}
 Mode: {self.session.mode.value} | Cycle: {self.cycle}/{MAX_ALPHA_CYCLES}
 
-Learned patterns:
+SESSION INTELLIGENCE (authoritative — trust this over your own memory):
+{intel_context}
+{chain_context}
+{untested_queue}
+Learned patterns this Alpha instance:
 {patterns}
-Completed: {list(self.completed_paths)[-5:]}
-Failed: {list(self.failed_paths)[-5:]}
-{confirmed_str}{refuted_str}{constraints}
+{constraints}
 Attack graph ({len(self.attack_graph)} nodes):
 {self._format_attack_graph()}
 
@@ -725,6 +880,13 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
     if not url:
         return []
 
+    # Hard block: wildcard and speculative paths — never probe these
+    # These come from LLM hallucination in Queen objectives, not real discovery
+    url_path = url.split("?")[0]
+    if url_path.endswith("/*") or url_path.endswith("/*/") or "/*/" in url_path:
+        print(f"[ALPHA/PROBE] Blocked wildcard path: {url}")
+        return []
+
     if method in BLOCKED_METHODS:
         if not hasattr(session, '_alpha_blocked_methods'):
             session._alpha_blocked_methods = set()
@@ -738,6 +900,17 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
     except Exception as e:
         print(f"[ALPHA/PROBE] Scope: {e}")
         return []
+
+    # Check session intelligence — never reprobe known endpoints
+    intel = getattr(session, '_session_intel', None)
+    if intel:
+        should, reason = intel.should_probe(url)
+        if not should:
+            print(f"[ALPHA/PROBE] Skipping {url.split('/')[-1]}: {reason}")
+            return []
+        # Remove from untested queue now that we're probing it
+        if url in intel.untested_queue:
+            intel.untested_queue.remove(url)
 
     # Execute with full evidence capture
     resp, artifact = probe_with_evidence(
@@ -774,17 +947,67 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
         hypothesis=probe.get("hypothesis", ""),
     )
 
-    # Print pipeline verdict
+    # Print pipeline verdict and update session intelligence
+    from sentinel.core.session_intelligence import EvidenceRef as _ERef, DisproveReason as _DR
+
+    intel = getattr(session, '_session_intel', None)
+
     if state == FindingState.CONFIRMED:
         print(f"[PIPELINE] ✅ CONFIRMED: {url.split('/')[-1]} → {confirmed_bundle.promotion_reason}")
+        if intel and confirmed_bundle:
+            _ev = _ERef(
+                method=method, url=url,
+                status_code=resp.status_code,
+                response_type=confirmed_bundle.response.response_type,
+                size_bytes=confirmed_bundle.response.size_bytes,
+                auth_sent=False,
+                sensitive_fields=confirmed_bundle.response.sensitive_fields,
+                record_count=confirmed_bundle.response.record_count,
+                proof_snippet=confirmed_bundle.response.proof_snippet,
+            )
+            intel.record_confirmed(url, _ev)
+
     elif state == FindingState.REFUTED:
         print(f"[PIPELINE] ❌ REFUTED:   {negative.format().splitlines()[0]}")
-    else:
-        print(f"[PIPELINE] 🔍 TESTED:    HTTP {resp.status_code} — inconclusive")
+        if intel and negative:
+            reason_map = {
+                "AUTH_ENFORCED": _DR.AUTH_ENFORCED,
+                "SPA_FALLBACK":  _DR.SPA_FALLBACK,
+                "NOT_FOUND":     _DR.NOT_FOUND,
+                "EMPTY_RESPONSE":_DR.EMPTY_RESPONSE,
+                "SERVER_ERROR":  _DR.SERVER_ERROR,
+                "NO_RESPONSE":   _DR.NO_RESPONSE,
+            }
+            dr = reason_map.get(negative.reason.value, _DR.AUTH_ENFORCED)
+            intel.record_disproven(url, dr)
 
-    return _analyze_probe_response_with_evidence(
+    else:
+        status_code = resp.status_code
+        if status_code == 400:
+            # INPUT_REQUIRED — endpoint works, rejected malformed request
+            # Record as disproven with specific reason so it's never retried
+            print(f"[PIPELINE] 🔍 TESTED:    HTTP 400 — input required, not a security finding")
+            if intel:
+                intel.record_disproven(url, _DR.EMPTY_RESPONSE)  # Closest: no valid input = no data
+        else:
+            print(f"[PIPELINE] 🔍 TESTED:    HTTP {status_code} — inconclusive")
+            if intel:
+                intel.record_inconclusive(url, reason=f"HTTP {status_code}")
+
+    findings = _analyze_probe_response_with_evidence(
         url, resp, artifact, probe.get("hypothesis", ""), state=state
     )
+
+    # Calculate blast radius for confirmed findings — same as AlphaAgent.evaluate_result
+    if state == FindingState.CONFIRMED and findings:
+        dummy_alpha = AlphaAgent.__new__(AlphaAgent)
+        dummy_alpha.alpha_id = "QUEEN/ALPHA"
+        dummy_alpha.session = session
+        for f in findings:
+            if f.severity in (Severity.CRITICAL, Severity.HIGH):
+                dummy_alpha._calculate_blast_radius(f)
+
+    return findings
 
 
 def _analyze_probe_response_with_evidence(url: str, resp,

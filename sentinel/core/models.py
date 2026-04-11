@@ -83,6 +83,7 @@ class Finding(BaseModel):
     mitre_tactic: Optional[str] = None
     mitre_technique: Optional[str] = None
     remediation:  Optional[str] = None
+    metadata:     dict           = Field(default_factory=dict)
     raw_output:   Optional[str] = None
     timestamp:    datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

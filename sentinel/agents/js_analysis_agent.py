@@ -248,6 +248,11 @@ def _find_endpoints(content: str, js_url: str, base: str) -> list[Finding]:
                 continue
 
         if accessible:
+            # Build full URL list — stored in metadata for orchestrator to pass to session_intel
+            all_urls = [
+                base + ep if ep.startswith("/") else ep
+                for ep in all_endpoints
+            ]
             findings_list = []
             findings_list.append(Finding(
                 agent=AgentName.JS,
@@ -265,6 +270,7 @@ def _find_endpoints(content: str, js_url: str, base: str) -> list[Finding]:
                     "Audit all discovered endpoints for authentication and authorization. "
                     "Remove unnecessary endpoints. Ensure all endpoints are covered by security testing."
                 ),
+                metadata={"discovered_endpoints": all_urls[:30]},
             ))
             return findings_list
 

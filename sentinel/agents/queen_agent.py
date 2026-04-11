@@ -35,6 +35,7 @@ import json
 from typing import Optional
 from dataclasses import dataclass, field
 from anthropic import Anthropic
+from sentinel.core.session_intelligence import SessionIntelligence, DisproveReason
 from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, ScanResult, Severity,
 )
@@ -43,7 +44,7 @@ client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 QUEEN_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-5-20251001")
 FALLBACK_MODEL = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
-MAX_QUEEN_CYCLES = 3  # Queen-level decision cycles (each spawns Alpha work)
+MAX_QUEEN_CYCLES = 2  # Queen-level decision cycles (each spawns Alpha work)
 
 
 # ── Data structures ───────────────────────────────────────────────────────────
@@ -82,24 +83,24 @@ You command Alpha agents. You see the complete picture.
 You make strategic decisions that no single Alpha can make alone.
 
 Your role:
-- Review what Alpha found and decide: is the investigation complete?
-- Identify investigation angles Alpha missed
-- Spawn new Alpha objectives when critical findings warrant deeper investigation
-- Correlate findings that create compound risks
+- Review what Alpha CONFIRMED and decide: is the investigation complete?
+- Spawn new objectives only when CONFIRMED findings warrant deeper investigation
+- Correlate CONFIRMED findings that create compound risks
 - Produce the organizational risk verdict
 
-Decision framework:
-1. What did Alpha find? Is the threat picture complete?
-2. What angles were NOT investigated? Why do they matter?
-3. What compound risks exist from combining findings?
-4. What is the overall risk to the organization?
-5. What are the 3 most critical immediate actions?
+STRICT OBJECTIVE RULES — violating these wastes budget:
+1. NEVER spawn an objective based on a SPA shell (75KB HTML) — proves nothing server-side
+2. NEVER spawn credential stuffing or brute force objectives without confirmed rate limit absence
+3. NEVER spawn objectives for endpoints that returned 401/403 — auth is enforced there
+4. ONLY spawn objectives for endpoints with confirmed data exposure
+5. If a finding was REFUTED, do not investigate it again under a different name
+6. Max 3 objectives per cycle
 
-New Alpha objectives you can spawn:
-- "Investigate authentication bypass paths using the JWT weakness"
-- "Map all API endpoints accessible with the admin credentials found"
-- "Check all subdomains for the same misconfigurations"
-- "Verify if the SQL injection condition can be triggered from other endpoints"
+Decision framework:
+1. What did Alpha CONFIRM? (HTTP 200 + JSON + no auth + data)
+2. From CONFIRMED findings: what adjacent tests follow logically?
+3. What compound risks exist from combining CONFIRMED findings?
+4. What is the overall risk verdict?
 
 You think at the organizational level. Alpha thinks at the target level.
 
@@ -173,6 +174,12 @@ class QueenAgent:
         self.alpha_count  = 0
         self.queen_cycle  = 0
         self.model        = self._get_best_model()
+        # Shared session intelligence — initialized by orchestrator before Queen runs
+        self.intel = getattr(session, '_session_intel', None)
+        if self.intel is None:
+            from sentinel.core.session_intelligence import SessionIntelligence
+            self.intel = SessionIntelligence(session.target)
+            session._session_intel = self.intel
         print(f"\n[QUEEN] Initialized | Target: {session.target} | Model: {self.model}")
 
     def _get_best_model(self) -> str:
@@ -225,14 +232,23 @@ class QueenAgent:
                 break
 
             # Queen spawns new Alphas for high-priority objectives
-            for obj in new_objectives:
+            for obj in new_objectives[:3]:  # Max 3 objectives per cycle
                 if obj.get("priority") not in ("CRITICAL", "HIGH"):
                     continue
 
-                print(f"\n[QUEEN] Spawning Alpha for: {obj.get('description','')[:80]}")
+                obj_desc = obj.get('description', '')
+                # Check if this objective is worth pursuing
+                should, reason = self.intel.queen_should_investigate(obj_desc)
+                if not should:
+                    print(f"[QUEEN] Skipping duplicate objective: {reason}")
+                    continue
+                print(f"\n[QUEEN] Spawning Alpha for: {obj_desc[:80]}")
 
                 # Run targeted agents for this objective
                 objective_findings = self._execute_objective(obj, agents_done)
+
+                # Record objective as completed regardless of findings
+                self.intel.record_queen_objective(obj_desc, bool(objective_findings))
 
                 if objective_findings:
                     obj_result = AlphaResult(
@@ -340,6 +356,14 @@ class QueenAgent:
             probe = action.get("probe", {})
             if not probe:
                 return [], False
+            # Normalize URL — always full URL
+            url = probe.get("url", "")
+            base = self.session.target.rstrip("/")
+            if url.startswith("/"):
+                url = base + url
+            elif not url.startswith("http"):
+                url = base + "/" + url
+            probe["url"] = url
             print(f"[QUEEN/ALPHA] Probe -> {probe.get('url','?')[:60]}")
             findings = execute_targeted_probe(probe, self.session)
             return findings, True
@@ -371,8 +395,14 @@ class QueenAgent:
                 findings.extend(f)
                 agents_done.add(agent)
 
-        # Probe specific targets
+        # Probe specific targets — normalize to full URLs
+        base = self.session.target.rstrip("/")
         for url in targets[:5]:
+            # Always ensure full URL — Queen sometimes returns relative paths
+            if url.startswith("/"):
+                url = base + url
+            elif not url.startswith("http"):
+                url = base + "/" + url
             from sentinel.agents.alpha_agent import execute_targeted_probe
             probe_findings = execute_targeted_probe(
                 {"url": url, "method": "GET",
@@ -403,8 +433,32 @@ class QueenAgent:
             for r in alpha_r
         )
 
+        # Include session intelligence to prevent objective repetition
+        intel_context = self.intel.get_queen_context()
+
+        # Check for chain intersections — escalate before new objectives
+        intersection_context = ""
+        if self.intel.attack_graph:
+            pending = self.intel.attack_graph.get_pending_intersections()
+            if pending:
+                intersection_context = "\nCHAIN INTERSECTIONS (assess these first):\n"
+                for ix in pending:
+                    intersection_context += (
+                        f"  ⚡ [{ix.combined_severity}] {ix.description}\n"
+                        f"     Chains: {ix.chain_a_id} + {ix.chain_b_id}\n"
+                        f"     Question: Can these combine into a higher-impact exploit path?\n"
+                    )
+                    self.intel.attack_graph.mark_intersection_escalated(ix)
+                intersection_context += (
+                    "\nFor each intersection: spawn one objective to verify if chains combine.\n"
+                    "If they do not combine, do NOT investigate further — move on.\n"
+                )
+
         prompt = f"""Target: {self.session.target}
 
+SESSION INTELLIGENCE (authoritative):
+{intel_context}
+{intersection_context}
 Alpha investigation results:
 {alpha_summary}
 
@@ -413,10 +467,20 @@ All findings so far ({len(all_f)} total):
 
 Compound risks identified: {len(self.intelligence.cross_target_chains)}
 
+STRICT RULES — HARD STOPS (violating these wastes budget):
+1. DO NOT create objectives that probe already-confirmed or disproven URLs
+2. DO NOT repeat objectives listed in "Completed objectives"
+3. NEVER spawn credential stuffing, brute force, or rate limiting tests — these require confirmed rate limiting absence, not just detection
+4. NEVER spawn objectives based on SPA shell responses (75KB HTML) — /login, /admin, /dashboard returned SPA shells, not real data
+5. NEVER spawn version-testing objectives (v1/v2/v3) — these are speculative transforms, not confirmed endpoints
+6. NEVER spawn objectives for 401/403 endpoints — auth is enforced, nothing to test there
+7. Only create objectives that follow directly from a CONFIRMED finding (HTTP 200 + JSON + no auth)
+8. If fewer than 2 confirmed findings exist, do not spawn more than 1 objective
+
 As Queen, review this intelligence and decide:
 1. Is the investigation complete? Do we have a full threat picture?
-2. What critical angles are missing?
-3. What new objectives should Alpha investigate?
+2. What genuinely NEW angles remain uninvestigated? (only from confirmed findings)
+3. What specific untested endpoints from the JS discovery remain?
 
 Return your strategic directive as JSON."""
 

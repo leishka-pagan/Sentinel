@@ -146,7 +146,15 @@ def _build_markdown_report(result: ScanResult) -> str:
         lines.append(f"| Hypotheses tested | {pipeline.get('hypotheses_tested', 0)} |")
         lines.append(f"| Confirmed (with evidence) | {pipeline.get('confirmed_findings', 0)} |")
         lines.append(f"| Refuted (NOT vulnerable) | {pipeline.get('refuted_findings', 0)} |")
+        lines.append(f"| Inconclusive | {pipeline.get('inconclusive', 0)} |")
         lines.append(f"| Confirmation rate | {pipeline.get('confirmation_rate', 0):.0%} |")
+        lines.append(f"| Probes prevented (dedup) | {pipeline.get('probes_prevented', 0)} |")
+
+        ag = pipeline.get('attack_graph', {})
+        if ag:
+            lines.append(f"| Attack chains active | {ag.get('active_chains', 0)} |")
+            lines.append(f"| Attack chains complete | {ag.get('complete_chains', 0)} |")
+            lines.append(f"| Chain intersections | {ag.get('intersections', 0)} |")
         lines.append("")
 
     lines.append("\n---\n")

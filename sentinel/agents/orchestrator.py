@@ -46,9 +46,17 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     print(f"\n[ORCHESTRATOR] Target={session.target} Mode={session.mode}")
     load_attack_data()
 
-    # Initialize eval harness
+    # Initialize eval harness and wire to scoring engine
     from sentinel.core.eval_harness import EvalHarness
     eval_harness = EvalHarness(session.target, session.mode.value)
+    import sentinel.agents._eval_ref as _eref
+    _eref.current_harness = eval_harness
+
+    # Initialize session intelligence (shared between Queen and Alpha)
+    from sentinel.core.session_intelligence import SessionIntelligence
+    session._session_intel = SessionIntelligence(session.target, session.mode.value)
+
+
 
     all_findings: list[Finding] = []
     agents_run:   list[AgentName] = []
@@ -83,6 +91,10 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
                     x.severity if x.severity in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"] else "INFO"))[:3]:
                 print(f"  [{f.severity}] {f.title[:70]}")
 
+            # Feed findings into session_intel immediately — so the next agent
+            # and Alpha never re-probe what this agent already settled
+            _populate_intel_from_findings(new_findings, session)
+
         # Autonomous replanning — Claude decides what to run next based on findings
         if not queue or any(f.severity in (Severity.CRITICAL, Severity.HIGH) for f in new_findings):
             replan = _replan(session, source_path, all_findings, done, queue)
@@ -106,6 +118,9 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
 
     all_findings = enrich_all(all_findings)
 
+    # Populate session_intel untested_queue from all agent findings
+    _populate_intel_from_findings(all_findings, session)
+
     # Enrich with OWASP standards mapping
     from sentinel.core.standards import enrich_finding_with_standards
     for f in all_findings:
@@ -113,10 +128,21 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
         if standards.get("control_family") != "Uncategorized":
             if not f.mitre_tactic or f.mitre_tactic == "Unknown":
                 f.mitre_tactic = standards.get("control_family", f.mitre_tactic)
-            # Append standards reference to description
             refs = standards.get("formatted_short", "")
             if refs and refs not in (f.description or ""):
                 f.description = (f.description or "") + f"\n📋 {refs}"
+
+    # Deduplicate and group root causes
+    all_findings = _deduplicate_findings(all_findings)
+    root_causes = _group_root_causes(all_findings, session)
+    if root_causes:
+        print(f"[ORCHESTRATOR] Root causes: {len(root_causes)} groups")
+        for rc in root_causes:
+            print(f"  [{rc['severity']}] {rc['title']}: {len(rc['endpoints'])} endpoints")
+        # Promote root causes to primary findings — replaces individual endpoint findings
+        # with a single grouped finding that names all affected endpoints
+        rc_findings = _root_causes_to_findings(root_causes)
+        all_findings.extend(rc_findings)
     all_findings = _enrich_intel(all_findings)
     all_findings.extend(_nvd_check(session, all_findings))
 
@@ -134,6 +160,8 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     result = _build_result(session, all_findings, agents_run)
 
     print(f"[ORCHESTRATOR] Running attack chain analysis...")
+    # Wire session onto result so chain engine can read session_intel confirmed URLs
+    result._session = session
     chains = analyze_attack_chains(result)
     result.attack_chains = chains_to_dict(chains)
     for c in chains:
@@ -144,17 +172,33 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     result.delta_markdown = delta_to_markdown(delta)
 
     result.summary = _summary(result, chains)
-    # Surface pipeline summary if available
-    if hasattr(session, '_pipeline'):
-        p = session._pipeline
-        summary = p.get_summary()
-        print(f"[PIPELINE] Summary: {summary['hypotheses_tested']} tested | "
-              f"{summary['confirmed_findings']} confirmed | "
-              f"{summary['refuted_findings']} refuted | "
-              f"confirmation rate: {summary['confirmation_rate']:.0%}")
-        # Add negative validations count to result
-        result.pipeline_summary = summary
-        result.negative_validations = len(p.refuted)
+
+    # Surface pipeline summary from session_intel (authoritative)
+    if hasattr(session, '_session_intel') and session._session_intel:
+        si = session._session_intel
+        si_summary = si.get_summary()
+        total_probed = si_summary.get('total_requests', 0)
+        confirmed    = si_summary.get('confirmed', 0)
+        disproven    = si_summary.get('disproven', 0)
+        rate         = round(confirmed / max(total_probed, 1), 2)
+
+        print(f"[PIPELINE] Summary: {total_probed} tested | "
+              f"{confirmed} confirmed | "
+              f"{disproven} refuted | "
+              f"confirmation rate: {rate:.0%}")
+
+        result.pipeline_summary = {
+            'hypotheses_tested':    total_probed,
+            'confirmed_findings':   confirmed,
+            'refuted_findings':     disproven,
+            'inconclusive':         si_summary.get('inconclusive', 0),
+            'confirmation_rate':    rate,
+            'probes_prevented':     si_summary.get('probes_prevented', 0),
+            'root_causes':          si_summary.get('root_causes', 0),
+            'chain_candidates':     si_summary.get('chain_candidates', 0),
+            'attack_graph':         si.attack_graph.get_summary() if si.attack_graph else {},
+        }
+        result.negative_validations = disproven
 
     # Run eval scoring
     eval_run = eval_harness.score(result)
@@ -563,6 +607,219 @@ If no agents should run, return {{}}.
         return result
 
 
+
+
+def _populate_intel_from_findings(findings: list, session):
+    """
+    Orchestrator reads structured metadata from findings and populates session_intel.
+    This keeps agents pure — they return findings, orchestrator coordinates intel.
+    Works for any target, not just Juice Shop.
+
+    Called after EVERY agent dispatch — ensures session_intel stays current
+    so Alpha never re-probes what any earlier agent already settled.
+    """
+    intel = getattr(session, '_session_intel', None)
+    if not intel:
+        return
+
+    from sentinel.core.session_intelligence import EvidenceRef as _ERef, DisproveReason as _DR
+
+    for f in findings:
+        url = f.file_path or ""
+        if not url or not url.startswith("http"):
+            continue
+
+        title = (f.title or "").lower()
+        desc  = (f.description or "").lower()
+
+        # Already settled by probe_agent — write into session_intel
+        # so Alpha never wastes a call on these
+        if "401" in desc or "auth: required" in desc or "authentication enforced" in desc:
+            if url not in intel.disproven_urls:
+                intel.record_disproven(url, _DR.AUTH_ENFORCED)
+
+        elif "spa route" in title or "spa shell" in desc or "spa fallback" in desc:
+            if url not in intel.disproven_urls:
+                intel.record_disproven(url, _DR.SPA_FALLBACK)
+
+        elif "confirmed unauthenticated" in title or "confirmed:" in desc:
+            if url not in intel.confirmed_urls:
+                _ev = _ERef(method="GET", url=url, status_code=200,
+                            response_type="JSON", size_bytes=500,
+                            auth_sent=False, sensitive_fields=[],
+                            record_count=None, proof_snippet="confirmed by probe_agent")
+                intel.record_confirmed(url, _ev)
+
+        elif "500" in desc or "server error" in desc or "inconclusive" in title:
+            if url not in intel.inconclusive_urls:
+                intel.record_inconclusive(url, reason="HTTP 500 from probe_agent")
+
+        # Extract discovered endpoints from JS agent metadata
+        meta = getattr(f, 'metadata', {}) or {}
+        discovered = meta.get('discovered_endpoints', [])
+        for ep_url in discovered:
+            if (ep_url not in intel.confirmed_urls and
+                ep_url not in intel.disproven_urls and
+                ep_url not in intel.untested_queue):
+                intel.untested_queue.append(ep_url)
+
+    if intel.untested_queue:
+        queued = len([u for u in intel.untested_queue
+                      if u not in intel.confirmed_urls
+                      and u not in intel.disproven_urls])
+        if queued:
+            print(f"[INTEL] Queued {queued} discovered endpoints for Alpha")
+
+
+
+def _root_causes_to_findings(root_causes: list[dict]) -> list[Finding]:
+    """
+    Convert root cause groups into primary findings.
+    Each root cause becomes one finding listing all affected endpoints.
+    This is the professional output — not 6 separate /api findings,
+    but one root cause with 6 affected endpoints.
+    """
+    from sentinel.core.models import Severity as _Sev
+    rc_findings = []
+    sev_map = {"CRITICAL": _Sev.CRITICAL, "HIGH": _Sev.HIGH,
+               "MEDIUM": _Sev.MEDIUM, "LOW": _Sev.LOW}
+
+    for rc in root_causes:
+        endpoints = rc.get("endpoints", [])
+        if len(endpoints) < 2:
+            continue  # Only worth surfacing if 2+ endpoints share root cause
+
+        sev = sev_map.get(rc.get("severity", "HIGH"), _Sev.HIGH)
+        ep_list = "\n".join(f"  - {ep}" for ep in endpoints[:10])
+
+        rc_findings.append(Finding(
+            agent=AgentName.PROBE,
+            title=f"[Root Cause] {rc['title']}",
+            description=(
+                f"Root issue: {rc['title']}\n"
+                f"Pattern: {rc.get('pattern', 'unknown')}\n"
+                f"Affected endpoints ({len(endpoints)}):\n{ep_list}\n"
+                f"Next action: {rc.get('next_action', 'Manual review required')}"
+            ),
+            severity=sev,
+            file_path=endpoints[0] if endpoints else "",
+            mitre_tactic="Multiple",
+            mitre_technique="Multiple — see individual findings",
+            remediation=(
+                f"Fix the root cause, not individual endpoints. "
+                f"Apply authentication middleware at the framework/router level "
+                f"to cover all {len(endpoints)} affected endpoints."
+            ),
+        ))
+    return rc_findings
+
+def _deduplicate_findings(findings: list[Finding]) -> list[Finding]:
+    """Remove duplicate findings — same URL + same type = one finding."""
+    seen = {}
+    unique = []
+    for f in findings:
+        # Key: finding type + URL (normalized)
+        url = (f.file_path or "").split("?")[0].rstrip("/")
+        title_key = f.title[:40].lower().replace("[alpha]", "").replace("[probe]", "").strip()
+        key = f"{title_key}|{url}"
+        if key not in seen:
+            seen[key] = True
+            unique.append(f)
+    
+    removed = len(findings) - len(unique)
+    if removed:
+        print(f"[ORCHESTRATOR] Deduplicated: removed {removed} duplicate findings")
+    return unique
+
+
+def _group_root_causes(findings: list[Finding], session: ScanSession) -> list[dict]:
+    """
+    Group findings by root cause pattern.
+    
+    Rules:
+    - CONFIRMED endpoints only anchor a root cause group
+    - INFERRED (detected, untested) can be listed as candidates separately
+    - REFUTED endpoints (401/403) are NEVER included — auth enforced is not a gap
+    - Requires 2+ endpoints to form a group
+    """
+    intel = getattr(session, '_session_intel', None)
+    if not intel:
+        return []
+
+    confirmed_urls  = intel.confirmed_urls
+    disproven_urls  = intel.disproven_urls
+
+    pattern_groups: dict = {}
+    for f in findings:
+        url   = f.file_path or ""
+        title = (f.title or "").lower()
+        desc  = (f.description or "").lower()
+
+        # Hard rule: skip anything that was refuted
+        if url in disproven_urls:
+            continue
+        # Hard rule: skip 401/403 findings — auth enforcement is GOOD
+        if "401" in desc or "auth: required" in desc or "authentication enforced" in desc:
+            continue
+
+        # Classify pattern
+        if "unauthenticated" in title or "no auth" in title:
+            pattern = "unauthenticated_api"
+        elif "rate limit" in title:
+            pattern = "no_rate_limiting"
+        elif "dangerous" in title and "method" in title:
+            pattern = "dangerous_methods"
+        elif "sql" in title or "injection" in title:
+            pattern = "sql_injection"
+        elif "spa route" in title or "spa fallback" in desc:
+            pattern = "spa_fallback"
+        else:
+            continue
+
+        if pattern not in pattern_groups:
+            pattern_groups[pattern] = {
+                "confirmed": [],
+                "inferred":  [],
+                "severity":  str(f.severity).split(".")[-1],
+            }
+
+        if url in confirmed_urls:
+            if url not in pattern_groups[pattern]["confirmed"]:
+                pattern_groups[pattern]["confirmed"].append(url)
+        else:
+            if url not in pattern_groups[pattern]["inferred"]:
+                pattern_groups[pattern]["inferred"].append(url)
+
+    # Build root cause dicts
+    # Only include groups with at least 1 confirmed endpoint
+    root_causes = []
+    for pattern, data in pattern_groups.items():
+        confirmed = data["confirmed"]
+        inferred  = data["inferred"]
+        if not confirmed:
+            continue  # No confirmed endpoints = no root cause
+
+        from sentinel.core.session_intelligence import EvidenceRef as _ERef
+        for url in confirmed:
+            _ev = _ERef(method="GET", url=url, status_code=200,
+                        response_type="JSON", size_bytes=500,
+                        auth_sent=False, sensitive_fields=[],
+                        record_count=None, proof_snippet="grouped confirmed finding")
+            intel._update_root_cause(url, _ev)
+
+    return [
+        {
+            "root_id":   rc.root_id,
+            "title":     rc.title,
+            "severity":  rc.severity,
+            "pattern":   rc.pattern,
+            "endpoints": rc.endpoints,
+            "next_action": rc.next_action,
+        }
+        for rc in intel.root_causes
+    ]
+
+
 def _build_result(session, findings, agents_run):
     by_sev = {}
     for f in findings: by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
@@ -571,30 +828,85 @@ def _build_result(session, findings, agents_run):
 
 
 def _summary(result: ScanResult, chains: list) -> str:
+    session       = getattr(result, '_session', None)
+    intel         = getattr(session, '_session_intel', None) if session else None
+    confirmed_urls = intel.confirmed_urls if intel else set()
+
+    # Build confirmed findings list — this is the ground truth for the summary
+    confirmed_findings = [
+        f for f in result.findings
+        if f.file_path and f.file_path in confirmed_urls
+    ]
+    inferred_findings = [
+        f for f in result.findings
+        if f not in confirmed_findings
+        and str(f.severity).split(".")[-1].upper() not in ("INFO",)
+    ]
+
+    # Fallback summary that doesn't require an API call
+    # Used if Claude call fails — must mention actual confirmed findings
+    if confirmed_findings:
+        top_confirmed = confirmed_findings[0]
+        desc_snippet  = (top_confirmed.description or "")[:120].split("\n")[0]
+        fallback = (
+            f"Scan confirmed {len(confirmed_findings)} vulnerabilit"
+            f"{'y' if len(confirmed_findings)==1 else 'ies'} at {result.target}. "
+            f"Top confirmed: [{str(top_confirmed.severity).split('.')[-1]}] "
+            f"{top_confirmed.title} — {desc_snippet}. "
+            f"{len(inferred_findings)} additional conditions detected but not confirmed. "
+            f"Review confirmed findings first."
+        )
+    else:
+        fallback = (
+            f"Scan complete. {result.total} findings at {result.target}. "
+            f"No findings met confirmation criteria this run. "
+            f"{len(inferred_findings)} conditions detected but unverified."
+        )
+
     if result.total == 0:
         return "No findings detected. This does not guarantee absence of vulnerabilities."
-    top = "\n".join(f"- [{f.severity}] {f.title}: {f.description[:100]}"
-                    for f in result.findings[:10])
-    chain_txt = "\n".join(f"- [{c.severity}] {c.title}" for c in chains[:3]) if chains else ""
+
+    confirmed_top = "\n".join(
+        f"[CONFIRMED] [{str(f.severity).split('.')[-1]}] {f.title}: "
+        f"{(f.description or '')[:120].split(chr(10))[0]}"
+        for f in confirmed_findings[:6]
+    ) or "No confirmed findings this scan."
+
+    inferred_top = "\n".join(
+        f"[UNVERIFIED] [{str(f.severity).split('.')[-1]}] {f.title}"
+        for f in inferred_findings[:4]
+    ) or ""
+
+    chain_txt = "\n".join(
+        f"- [{getattr(c, 'severity', c.get('severity','?') if isinstance(c, dict) else '?')}] "
+        f"{getattr(c, 'title', c.get('title','?') if isinstance(c, dict) else '?')}"
+        for c in chains[:3]
+    ) if chains else ""
+
+    SUMMARY_SYSTEM = (
+        "You are a blue team security analyst writing an executive summary. "
+        "Respond with plain prose only — 3 to 5 sentences. "
+        "No JSON, no markdown headers, no bullet points. "
+        "Start directly with your assessment."
+    )
     try:
         resp = client.messages.create(
-            model=MODEL, max_tokens=500, system=SYSTEM,
+            model=MODEL, max_tokens=400, system=SUMMARY_SYSTEM,
             messages=[{"role": "user", "content":
-                f"Write a 3-5 sentence blue team executive summary.\n"
-                f"Target: {result.target} | Mode: {result.mode} | Total: {result.total}\n"
-                f"Severity: {result.by_severity}\n"
-                f"Top findings:\n{top}\n"
-                f"{'Chains:\n'+chain_txt if chain_txt else ''}\n"
-                f"RULES:\n"
-                f"- Only claim findings that were CONFIRMED by direct HTTP evidence\n"
-                f"- If admin endpoints returned SPA shell (HTML ~75KB), do NOT claim admin access\n"
-                f"- Only use CRITICAL severity for findings with confirmed evidence artifacts\n"
-                f"- Distinguish between CONFIRMED findings and INFERRED conditions\n"
-                f"- Format: 'We confirmed X. We detected conditions for Y (unverified).'\n"
-                f"Lead with confirmed findings. Defensive next steps only."}])
+                f"Target: {result.target} | Mode: {result.mode}\n\n"
+                f"CONFIRMED findings (proven — lead with these):\n{confirmed_top}\n\n"
+                f"UNVERIFIED conditions (mention as unverified only):\n{inferred_top}\n"
+                f"{'Confirmed chains:\n'+chain_txt if chain_txt else ''}\n\n"
+                f"STRICT RULES:\n"
+                f"- Your first sentence MUST reference a specific confirmed finding by name\n"
+                f"- If no confirmed findings exist, say so explicitly\n"
+                f"- Never say 'systematic' unless 3+ confirmed findings share a pattern\n"
+                f"- SPA shell routes are NOT admin access — never claim admin access from them\n"
+                f"- 401 = auth IS enforced — never say auth is missing for those endpoints\n"
+                f"- Blast radius: only cite measured numbers (111 records), never estimates"}])
         return resp.content[0].text.strip()
     except Exception:
-        return f"Scan complete. {result.total} findings. Review CRITICAL and HIGH items first."
+        return fallback
 
 
 def _clean(raw: str) -> str:

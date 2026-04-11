@@ -11,7 +11,7 @@ Checks for:
 - Server version disclosure
 - Directory listing exposure
 
-SCOPE: PASSIVE and ACTIVE modes.
+SCOPE: PASSIVE, PROBE, and ACTIVE modes.
 ACTIONS: http_headers, header_analysis, config_read
 NEVER: exploits, writes, modifies anything
 """

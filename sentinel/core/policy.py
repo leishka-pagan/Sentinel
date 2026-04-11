@@ -1,27 +1,19 @@
 """
 sentinel/core/policy.py
 
-Policy Enforcement Layer.
+Policy Enforcement Layer — delegates to validator.py (THE authoritative safety layer).
 
-Not "safe by convention" — safe by architecture.
+ARCHITECTURE NOTE:
+  validator.py is the single source of truth for what actions are permitted.
+  This module exists as a thin compatibility shim and for rate-limit tracking.
 
-Every action that Sentinel takes must pass through the policy gate.
-The gate enforces:
-  - Allowed target classes
-  - Max probe intensity
-  - Max request count per endpoint
-  - No destructive methods by default
-  - No credential attacks by default
-  - No payload classes outside approved mode
-  - No escalation from TEST to CONFIRM without policy eligibility
+  Do NOT add new enforcement logic here. Add it to validator.py.
+  Two enforcement layers that can drift is worse than one consistent layer.
 
-Policy violations raise PolicyViolation — they are never silently bypassed.
-
-Policy profiles:
-  PASSIVE   — read-only observation, no probing
-  PROBE     — active-safe probing, no exploitation
-  ACTIVE    — full suite (Nuclei), double confirmation required
-  AUDIT     — PROBE + standards compliance checking
+  policy.py is retained for:
+    - Per-endpoint request counting (rate limiting)
+    - Payload-class semantic labelling (context for validators, not enforcement)
+    - Future: per-scan budget tracking
 """
 
 from dataclasses import dataclass, field
@@ -30,7 +22,7 @@ from enum import Enum
 
 
 class PolicyViolation(Exception):
-    """Raised when an action violates policy. Never silently caught."""
+    """Raised when a rate limit or budget is exceeded."""
     pass
 
 
@@ -38,93 +30,43 @@ class PolicyProfile(str, Enum):
     PASSIVE = "PASSIVE"
     PROBE   = "PROBE"
     ACTIVE  = "ACTIVE"
-    AUDIT   = "AUDIT"   # PROBE + compliance checking
+    AUDIT   = "AUDIT"
 
 
 @dataclass
 class PolicyGate:
     """
-    The policy enforcement object.
-    Created once per scan session and passed to all agents.
+    Rate-limit and budget tracker.
+    Enforcement (what's blocked) lives in validator.py.
+    This tracks counts only.
     """
     profile:              PolicyProfile
     max_requests_total:   int
     max_requests_per_ep:  int
-    allowed_methods:      set[str]
-    blocked_methods:      set[str]
-    allowed_payload_classes: set[str]
-    blocked_payload_classes: set[str]
-    allow_credential_testing: bool
-    allow_destructive:    bool
-    require_evidence_for_confirm: bool
     request_count:        dict = field(default_factory=dict)
     total_requests:       int = 0
 
-    def check(self, action: str, target: str, method: str = "GET",
-              payload_class: Optional[str] = None) -> bool:
+    def check_rate_limit(self, target: str) -> bool:
         """
-        Check if an action is permitted.
-        Raises PolicyViolation if not permitted.
-        Returns True if permitted.
+        Check and increment request counters.
+        Raises PolicyViolation only if a rate limit is exceeded.
+        All action-type enforcement is handled by validator.validate_action().
         """
-        method = method.upper()
-
-        # Blocked methods — always blocked regardless of mode
-        if method in self.blocked_methods:
-            raise PolicyViolation(
-                f"Method {method} is blocked by policy (profile: {self.profile.value}). "
-                f"Blocked methods: {self.blocked_methods}"
-            )
-
-        # Destructive actions
-        if not self.allow_destructive and method in {"DELETE", "PUT", "PATCH"}:
-            raise PolicyViolation(
-                f"Destructive method {method} requires allow_destructive=True. "
-                f"Current profile: {self.profile.value}"
-            )
-
-        # Payload class check
-        if payload_class:
-            if payload_class in self.blocked_payload_classes:
-                raise PolicyViolation(
-                    f"Payload class '{payload_class}' is blocked by policy. "
-                    f"Blocked: {self.blocked_payload_classes}"
-                )
-            if self.allowed_payload_classes and \
-               payload_class not in self.allowed_payload_classes:
-                raise PolicyViolation(
-                    f"Payload class '{payload_class}' not in allowed set. "
-                    f"Allowed: {self.allowed_payload_classes}"
-                )
-
-        # Credential testing
-        if not self.allow_credential_testing and action == "credential_test":
-            raise PolicyViolation(
-                "Credential testing requires allow_credential_testing=True. "
-                f"Current profile: {self.profile.value}"
-            )
-
-        # Rate limits
         ep_count = self.request_count.get(target, 0)
         if ep_count >= self.max_requests_per_ep:
             raise PolicyViolation(
-                f"Max requests per endpoint ({self.max_requests_per_ep}) reached for {target}. "
-                "Stop probing this endpoint."
+                f"Rate limit: max {self.max_requests_per_ep} requests per endpoint reached for {target}."
             )
-
         if self.total_requests >= self.max_requests_total:
             raise PolicyViolation(
-                f"Total request limit ({self.max_requests_total}) reached. "
-                "Scan must conclude."
+                f"Budget exhausted: {self.max_requests_total} total requests reached."
             )
-
-        # Record
         self.request_count[target] = ep_count + 1
         self.total_requests += 1
         return True
 
     def record_request(self, target: str):
-        """Record a request against the policy counter."""
+        """Record a request without blocking."""
         self.request_count[target] = self.request_count.get(target, 0) + 1
         self.total_requests += 1
 
@@ -135,98 +77,34 @@ class PolicyGate:
             "max_requests":     self.max_requests_total,
             "endpoints_probed": len(self.request_count),
             "budget_remaining": self.max_requests_total - self.total_requests,
-            "top_endpoints":    sorted(self.request_count.items(),
-                                       key=lambda x: x[1], reverse=True)[:5],
         }
 
 
-# ── Policy profiles ───────────────────────────────────────────────────────────
-
 def get_policy(profile: PolicyProfile) -> PolicyGate:
-    """Get the policy gate for a given profile."""
+    """Get a rate-limit gate for a scan profile."""
+    limits = {
+        PolicyProfile.PASSIVE: (50,  2),
+        PolicyProfile.PROBE:   (300, 5),
+        PolicyProfile.ACTIVE:  (1000, 10),
+        PolicyProfile.AUDIT:   (400,  5),
+    }
+    total, per_ep = limits.get(profile, (300, 5))
+    return PolicyGate(
+        profile=profile,
+        max_requests_total=total,
+        max_requests_per_ep=per_ep,
+    )
 
-    if profile == PolicyProfile.PASSIVE:
-        return PolicyGate(
-            profile=profile,
-            max_requests_total=50,
-            max_requests_per_ep=2,
-            allowed_methods={"GET", "HEAD", "OPTIONS"},
-            blocked_methods={"POST", "PUT", "DELETE", "PATCH"},
-            allowed_payload_classes=set(),
-            blocked_payload_classes={"exploit", "injection", "brute_force",
-                                      "fuzzing", "dos", "credential"},
-            allow_credential_testing=False,
-            allow_destructive=False,
-            require_evidence_for_confirm=True,
-        )
-
-    elif profile == PolicyProfile.PROBE:
-        return PolicyGate(
-            profile=profile,
-            max_requests_total=300,
-            max_requests_per_ep=5,
-            allowed_methods={"GET", "HEAD", "OPTIONS", "POST"},
-            blocked_methods={"DELETE", "PUT", "PATCH"},
-            allowed_payload_classes={"observation", "error_probe", "auth_test"},
-            blocked_payload_classes={"exploit", "brute_force", "fuzzing",
-                                      "dos", "injection_payload"},
-            allow_credential_testing=True,   # Test creds in known test apps
-            allow_destructive=False,
-            require_evidence_for_confirm=True,
-        )
-
-    elif profile == PolicyProfile.ACTIVE:
-        return PolicyGate(
-            profile=profile,
-            max_requests_total=1000,
-            max_requests_per_ep=10,
-            allowed_methods={"GET", "HEAD", "OPTIONS", "POST"},
-            blocked_methods={"DELETE", "PUT", "PATCH"},  # Still blocked even in ACTIVE
-            allowed_payload_classes={"observation", "error_probe", "auth_test",
-                                      "nuclei_safe", "cve_detection"},
-            blocked_payload_classes={"exploit", "brute_force", "fuzzing", "dos"},
-            allow_credential_testing=True,
-            allow_destructive=False,
-            require_evidence_for_confirm=True,
-        )
-
-    elif profile == PolicyProfile.AUDIT:
-        return PolicyGate(
-            profile=profile,
-            max_requests_total=400,
-            max_requests_per_ep=5,
-            allowed_methods={"GET", "HEAD", "OPTIONS", "POST"},
-            blocked_methods={"DELETE", "PUT", "PATCH"},
-            allowed_payload_classes={"observation", "error_probe", "auth_test",
-                                      "compliance_check"},
-            blocked_payload_classes={"exploit", "brute_force", "fuzzing", "dos"},
-            allow_credential_testing=True,
-            allow_destructive=False,
-            require_evidence_for_confirm=True,
-        )
-
-    raise ValueError(f"Unknown policy profile: {profile}")
-
-
-# ── Policy-aware probe wrapper ────────────────────────────────────────────────
 
 def policy_check_probe(url: str, method: str, policy: PolicyGate,
                        payload_class: str = "observation") -> bool:
     """
-    Check probe against policy before executing.
-    Call this before every HTTP request in every agent.
+    Check rate limits before a probe.
+    Action-type enforcement (blocked methods, modes) is in validator.validate_action().
+    Call both: validate_action() for what's allowed, this for how many times.
     """
     try:
-        return policy.check(
-            action="http_probe",
-            target=url,
-            method=method,
-            payload_class=payload_class,
-        )
+        return policy.check_rate_limit(url)
     except PolicyViolation as e:
-        print(f"[POLICY] BLOCKED: {e}")
+        print(f"[POLICY] Rate limit: {e}")
         return False
-
-
-# For type hints
-from typing import Optional

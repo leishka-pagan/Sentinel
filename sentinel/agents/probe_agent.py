@@ -77,7 +77,7 @@ def run_probe_agent(session: ScanSession, target_url: str) -> list[Finding]:
     findings.extend(_check_api_endpoints(base, session))
     findings.extend(_check_auth_weaknesses(base, session))
     findings.extend(_check_idor(base, session))
-    findings.extend(_check_method_tampering(base, session))
+    findings.extend(_check_dangerous_methods(base, session))
     findings.extend(_check_rate_limiting(base, session))
 
     print(f"[PROBE] {len(findings)} probe findings")
@@ -391,40 +391,94 @@ def _check_idor(base: str, session: ScanSession) -> list[Finding]:
 
 # ── HTTP Method Tampering ─────────────────────────────────────────────────────
 
-def _check_method_tampering(base: str, session: ScanSession) -> list[Finding]:
-    """Check if endpoints accept unexpected HTTP methods."""
-    findings = []
+def _check_dangerous_methods(base: str, session: ScanSession) -> list[Finding]:
+    """
+    Check if endpoints accept dangerous HTTP methods.
 
+    Two-stage validation:
+    1. OPTIONS probe — what methods does the server advertise?
+    2. For each dangerous method advertised, send an unauthenticated request
+       and check if it's accepted (2xx/4xx with data) vs blocked (401/403/405)
+
+    A finding is only raised if a method is BOTH advertised AND not blocked.
+    """
+    findings = []
     test_endpoints = ["/api/users", "/api/user/1", "/api/orders"]
 
     for path in test_endpoints:
         url = base + path
         try:
-            # Test OPTIONS to see what methods are allowed
-            resp = requests.options(url, headers=HEADERS, timeout=TIMEOUT,
-                                    verify=False)
-            allow = resp.headers.get("Allow", "") or resp.headers.get("Access-Control-Allow-Methods", "")
+            # Stage 1: OPTIONS
+            resp = requests.options(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+            allow = (resp.headers.get("Allow", "") or
+                     resp.headers.get("Access-Control-Allow-Methods", ""))
 
-            if allow:
-                dangerous = [m for m in ["DELETE", "PUT", "PATCH"] if m in allow.upper()]
-                if dangerous:
-                    findings.append(Finding(
-                        agent=AgentName.PROBE,
-                        title=f"Dangerous HTTP Methods Allowed: {path}",
-                        description=(
-                            f"Endpoint {url} allows HTTP methods: {', '.join(dangerous)}. "
-                            "If not properly authenticated, these could allow data modification or deletion."
-                        ),
-                        severity=Severity.MEDIUM,
-                        file_path=url,
-                        mitre_tactic="Initial Access",
-                        mitre_technique="T1190 — Exploit Public-Facing Application",
-                        remediation=(
-                            "Disable HTTP methods that are not needed. "
-                            "Ensure DELETE/PUT/PATCH require proper authentication AND authorization. "
-                            "Return 405 Method Not Allowed for unused methods."
-                        ),
-                    ))
+            if not allow:
+                continue
+
+            dangerous_advertised = [m for m in ["DELETE", "PUT", "PATCH"] if m in allow.upper()]
+            if not dangerous_advertised:
+                continue
+
+            # Stage 2: Test each dangerous method — is it actually accepted?
+            accepted = []
+            blocked  = []
+            for method in dangerous_advertised:
+                try:
+                    test_resp = requests.request(
+                        method, url,
+                        headers=HEADERS,
+                        timeout=TIMEOUT,
+                        verify=False,
+                        allow_redirects=False,
+                    )
+                    if test_resp.status_code in (401, 403, 405):
+                        blocked.append(f"{method}→{test_resp.status_code}")
+                    elif test_resp.status_code < 500:
+                        accepted.append(f"{method}→{test_resp.status_code}")
+                    # 500 = method reached but server error — note separately
+                except requests.RequestException:
+                    continue
+
+            if accepted:
+                # Methods are advertised AND accepted without auth — real finding
+                findings.append(Finding(
+                    agent=AgentName.PROBE,
+                    title=f"Dangerous HTTP Methods Accepted Without Auth: {path}",
+                    description=(
+                        f"Endpoint {url} accepts dangerous methods without authentication. "
+                        f"Accepted (unauthenticated): {', '.join(accepted)}. "
+                        f"Blocked: {', '.join(blocked) or 'none'}. "
+                        f"Advertised via OPTIONS: {allow}."
+                    ),
+                    severity=Severity.HIGH,
+                    file_path=url,
+                    mitre_tactic="Initial Access",
+                    mitre_technique="T1190 — Exploit Public-Facing Application",
+                    remediation=(
+                        f"Block {', '.join(m.split('→')[0] for m in accepted)} on {path}. "
+                        "Return 401 for unauthenticated dangerous method requests."
+                    ),
+                ))
+            elif dangerous_advertised:
+                # Methods advertised but all blocked — downgraded finding
+                findings.append(Finding(
+                    agent=AgentName.PROBE,
+                    title=f"Dangerous HTTP Methods Advertised (Auth Enforced): {path}",
+                    description=(
+                        f"Endpoint {url} advertises {', '.join(dangerous_advertised)} via OPTIONS "
+                        f"but all were blocked with auth enforcement: {', '.join(blocked)}. "
+                        f"Authorization appears to be enforced — no confirmed vulnerability."
+                    ),
+                    severity=Severity.LOW,
+                    file_path=url,
+                    mitre_tactic="Discovery",
+                    mitre_technique="T1046 — Network Service Scanning",
+                    remediation=(
+                        "Consider restricting OPTIONS response to not advertise methods "
+                        "that should not be publicly known."
+                    ),
+                ))
         except requests.RequestException:
             continue
 

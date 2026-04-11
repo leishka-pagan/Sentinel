@@ -70,7 +70,7 @@ class EvidenceArtifact:
         if self.response.record_count is not None:
             lines.append(f"  │ Records:  {self.response.record_count} returned")
         if self.response.sensitive_fields:
-            lines.append(f"  │ Sensitive fields: {', '.join(self.response.sensitive_fields)}")
+            lines.append(f"  │ Sensitive keys in JSON: {', '.join(self.response.sensitive_fields)}")
         if self.response.sample:
             lines.append(f"  │ Sample:   {self.response.sample}")
         lines.append(f"  │ Confirmed: {'YES' if self.confirmed else 'NO'}")
@@ -95,7 +95,7 @@ class EvidenceArtifact:
         if self.response.record_count is not None:
             lines.append(f"Records:       {self.response.record_count}")
         if self.response.sensitive_fields:
-            lines.append(f"Sensitive:     {', '.join(self.response.sensitive_fields)}")
+            lines.append(f"Sensitive keys in JSON: {', '.join(self.response.sensitive_fields)}")
         if self.response.sample:
             lines.append(f"Sample:        {self.response.sample}")
         lines.append(f"Confirmed:     {'YES' if self.confirmed else 'NO — requires further verification'}")
@@ -210,12 +210,31 @@ def _build_artifact(req: RequestArtifact, resp: _requests.Response,
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Detect sensitive fields
+    # Detect sensitive fields — parse actual JSON keys, not substring match
+    # Substring match produces false positives (e.g. "password" in URL strings)
     sensitive = []
-    content_lower = content.lower()
-    for field in SENSITIVE_FIELDS:
-        if field in content_lower:
-            sensitive.append(field)
+    if rtype == "JSON":
+        try:
+            data = json.loads(content)
+            # Flatten all keys from the JSON structure
+            all_keys = set()
+            def _collect_keys(obj, depth=0):
+                if depth > 4:
+                    return
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        all_keys.add(k.lower())
+                        _collect_keys(v, depth + 1)
+                elif isinstance(obj, list):
+                    for item in obj[:3]:  # Sample first 3 items
+                        _collect_keys(item, depth + 1)
+            _collect_keys(data)
+            # Only flag fields that actually exist as JSON keys
+            for field_name in SENSITIVE_FIELDS:
+                if field_name.lower() in all_keys:
+                    sensitive.append(field_name)
+        except (json.JSONDecodeError, ValueError):
+            pass  # Not valid JSON — no sensitive fields claimed
 
     # Build sanitized sample
     sample = _build_sample(content, rtype, status)
@@ -332,6 +351,50 @@ def _failed_artifact(req: RequestArtifact, error: str) -> EvidenceArtifact:
         confirmed=False,
         notes=[error],
     )
+
+
+def safe_request(method: str, url: str, headers: Optional[dict] = None,
+                 timeout: int = 10, **kwargs) -> Optional[_requests.Response]:
+    """
+    Safe HTTP request wrapper for agents.
+    Use this instead of raw requests.get/post in agents.
+
+    Benefits over raw requests:
+    - Enforces TLS verification=False only for lab targets (localhost/127.0.0.1)
+    - Always sets User-Agent
+    - Catches all exceptions — never propagates network errors to callers
+    - Single place to add future audit logging or rate limiting
+
+    Usage (replace):
+        requests.get(url, headers=HEADERS, timeout=10, verify=False)
+    With:
+        safe_request("GET", url, headers=HEADERS, timeout=10)
+    """
+    from urllib.parse import urlparse
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    _requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    base_headers = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
+    if headers:
+        base_headers.update(headers)
+
+    # Only disable TLS verification for known local/lab targets
+    parsed = urlparse(url)
+    is_lab = parsed.hostname in ("localhost", "127.0.0.1", "::1") or \
+             (parsed.hostname or "").endswith(".local")
+    verify = False if is_lab else True
+
+    try:
+        return _requests.request(
+            method.upper(), url,
+            headers=base_headers,
+            timeout=timeout,
+            verify=verify,
+            allow_redirects=kwargs.pop("allow_redirects", False),
+            **kwargs,
+        )
+    except Exception:
+        return None
 
 
 # For type hints
