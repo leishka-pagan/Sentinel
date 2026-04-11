@@ -114,7 +114,8 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
         # Autonomous safety net — for PROBE/ACTIVE, reason about dropped agents
         # Don't just blindly add them — ask Claude if they're still needed given findings
         if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE):
-            probe_agents = ["probe_agent", "js_agent", "api_agent", "disclosure_agent"]
+            probe_agents = ["probe_agent", "js_agent", "api_agent", "disclosure_agent",
+                            "wordpress_enum_agent", "wordpress_agent", "salesforce_agent"]
             dropped = [a for a in probe_agents if a not in done and a not in queue]
             if dropped and all_findings:
                 decision = _should_run_dropped(dropped, all_findings, session)
