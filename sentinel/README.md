@@ -1,337 +1,212 @@
-# 🛡️ Sentinel — AI Security Reasoning Platform
+# 🛡️ Sentinel — AI-Powered Vulnerability Intelligence Platform
 
 > **Blue team first. Find everything. Exploit nothing. Prove everything.**
 
-Sentinel is not a vulnerability scanner.
-It is a **controlled AI security reasoning system** that discovers, verifies, and documents security weaknesses under evidence and policy constraints.
+Sentinel is an autonomous multi-agent AI security platform that orchestrates specialized agents to discover and validate vulnerabilities across web applications — and stops there. Every finding is backed by real HTTP evidence. No exploitation. No synthetic results. No action without explicit human authorization.
 
-The difference matters:
-- A scanner finds things and reports them.
-- Sentinel finds things, tests them, confirms them with evidence, maps them to standards, and explains what they mean for defenders.
-
----
-
-## What Makes Sentinel Different
-
-| Capability | Sentinel | Traditional Scanner |
-|---|---|---|
-| Findings require evidence | ✅ Enforced | ❌ Often inferred |
-| Standards mapping (ASVS/WSTG) | ✅ Every finding | ❌ Rarely |
-| Negative validation | ✅ Explicit NOT VULNERABLE records | ❌ Silently skipped |
-| Hallucination detection | ✅ Built-in calibration engine | ❌ N/A |
-| Policy enforcement | ✅ Architecture-level gates | ❌ Convention only |
-| Autonomous reasoning | ✅ Queen → Alpha hierarchy | ❌ Static rule engine |
-| Reproducible findings | ✅ Request/response artifacts | ❌ Often not |
+Built and actively used against live authorized targets as part of the [WiCyS Vulnerability Disclosure Program](https://www.wicys.org).
 
 ---
 
 ## Architecture
 
 ```
-USER
-  ↓  run_scan.py --mode PROBE --confirm
-SENTINEL
-  ↓
-POLICY GATE ← enforces allowed methods, payload classes, request budget
-  ↓
-QUEEN (sovereign commander — PROBE/ACTIVE modes)
-  ↓ commands
-  ├── ALPHA-1 (autonomous threat investigator)
-  │     ├── Hypothesis scoring (CVSS-anchored, not AI assertion)
-  │     ├── Attack graph builder
-  │     ├── Blast radius calculator (measured, not estimated)
-  │     ├── Self-correcting reasoning (learns within session)
-  │     ├── Defensive gap analysis
-  │     ├── Exploit probability scoring
-  │     └── Threat actor profiling
-  │
-  ↓ directs
-ORCHESTRATOR (iterative agent dispatcher)
-  ↓
-AGENTS
-  ├── recon_agent       Passive recon, DNS, HTTP headers
-  ├── config_agent      Security headers, CORS, cookies
-  ├── network_agent     Port exposure, subdomain enum
-  ├── probe_agent       Endpoint discovery, auth weakness, IDOR
-  ├── js_agent          JS secrets, source maps, hidden endpoints
-  ├── api_agent         GraphQL, Swagger, API auth analysis
-  ├── disclosure_agent  Sensitive files, stack traces, debug endpoints
-  ├── injection_agent   SQL/XSS condition detection (no payloads)
-  ├── auth_scan_agent   Authenticated IDOR, privilege escalation
-  ├── sast_agent        Static analysis (Bandit, Semgrep, TruffleHog)
-  ├── deps_agent        CVE scanning (pip-audit, npm audit)
-  ├── logic_agent       Business logic flaws (Claude-powered)
-  └── nuclei_agent      Template-based scanning (ACTIVE mode only)
-  ↓
-FINDING PIPELINE (formal state machine)
-  HYPOTHESIS → TESTED → CONFIRMED | REFUTED
-  ↓
-STANDARDS ENGINE
-  ASVS + WSTG mapping for every finding
-  ↓
-EVAL HARNESS
-  Precision, recall, confirmation rate, evidence coverage
+User (authorized target + mode + --confirm flag)
+        │
+   Consent & Scope Gate  ← hard stop if target not in APPROVED_TARGETS
+        │
+   Orchestrator  ← dispatches agents, replans dynamically, enforces iteration ceiling
+        │
+   ┌────────────────────────────────────────────────────────────┐
+   │                    Agent Suite (PROBE mode)                 │
+   ├── recon_agent          DNS, tech stack, header analysis     │
+   ├── config_agent         Security misconfigurations           │
+   ├── network_agent        Network topology, mail servers       │
+   ├── probe_agent          Auth bypass, IDOR, rate limiting     │
+   ├── js_agent             JS secrets, hidden endpoints         │
+   ├── api_agent            GraphQL, Swagger, API auth           │
+   ├── disclosure_agent     Sensitive file exposure              │
+   ├── injection_agent      SQL/injection conditions (no payloads)│
+   ├── auth_scan_agent      Session and auth weakness            │
+   ├── wordpress_enum_agent Author enum, xmlrpc, robots.txt      │
+   ├── wordpress_agent      WP REST API, user enum, 429-aware    │
+   └── salesforce_agent     Experience Cloud, /services/data/    │
+        │
+   Queen Agent  ← sovereign commander, strategic review
+        │
+   Alpha Agent(s)  ← autonomous threat investigator, hypothesis engine
+        │
+   Finding Pipeline  ← CONFIRMED / REFUTED / INCONCLUSIVE / TESTED
+        │
+   Session Intelligence  ← authoritative state: confirmed_urls, disproven_urls
+        │
+   Attack Graph + Chain Analysis  ← MITRE ATT&CK mapping, blast radius
+        │
+   Reporter  ← structured JSON + Markdown, evidence-backed, no hallucinations
 ```
 
 ---
 
 ## Scan Modes
 
-| Mode | Agents | Use Case |
+| Mode | Agents Active | Notes |
 |---|---|---|
-| `PASSIVE` | recon, config, network | Initial surface mapping |
-| `CODE` | sast, deps, logic | Source code review |
-| `PROBE` | All + Queen + Alpha | Active-safe vulnerability discovery |
-| `ACTIVE` | Everything + Nuclei | Full scan (double confirmation required) |
+| `PASSIVE` | recon, config, network | Read-only observation |
+| `CODE` | sast, deps, logic | Source code only, no network |
+| `PROBE` | Full 12-agent suite | Active-safe — finds real vulns, no exploitation |
+| `ACTIVE` | All agents + nuclei | Requires double confirmation |
 
 ---
 
-## The Finding Pipeline
+## Evidence Model
 
-Every finding passes through a formal state machine:
+Every confirmed finding requires a real `EvidenceRef` constructed from an actual HTTP response. No synthetic values. No regex-parsed descriptions. No hallucinated confirmations.
 
-```
-HYPOTHESIS
-  AI proposes something to investigate
-  Confidence: 0.25 max (no evidence)
-  ↓
-TESTED
-  HTTP request sent, response received, metadata captured
-  Confidence: context-dependent
-  ↓
-CONFIRMED                    REFUTED
-  All criteria met:            Any of:
-  - HTTP 200                   - HTTP 401/403 → AUTH_ENFORCED
-  - JSON response              - HTML ~75KB  → SPA_FALLBACK
-  - No auth header sent        - HTTP 404    → NOT_FOUND
-  - Size > 200 bytes           - HTTP 500    → SERVER_ERROR
-  - Not SPA shell              - No response → NO_RESPONSE
-  ↓
-Evidence bundle attached:
-  - Request record (method, url, auth_sent)
-  - Response record (status, type, size, records, sensitive fields)
-  - Proof snippet (sanitized sample)
-  - Promotion reason
+```python
+EvidenceRef(
+    method="GET",
+    url="https://target.com/api/Users",
+    status_code=200,
+    response_type="JSON",       # classified from real Content-Type
+    size_bytes=59605,           # real content length
+    auth_sent=False,            # explicit, not assumed
+    sensitive_fields=["password", "token"],  # matched in response
+    record_count=111,           # counted from actual JSON array
+    proof_snippet="Array[111]..." # sanitized sample from response
+)
 ```
 
-Nothing advances state without meeting these criteria. No exceptions.
+A finding is `CONFIRMED` only when `is_sufficient_for_confirmation()` passes:
+- HTTP 200
+- Response type is JSON (not HTML, not EMPTY)
+- `size_bytes >= 200`
+- `proof_snippet` is present
+- `auth_sent == False`
 
 ---
 
-## Standards Mapping
-
-Every confirmed finding maps to:
+## Finding State Machine
 
 ```
-Control Family: Authentication
-ASVS V2.2.1 (L1) — Anti-Automation Controls
-  Requirement: Verify anti-automation controls are effective at
-               mitigating breached credential testing.
-WSTG-AUTHN-03 — Testing for Weak Lock Out Mechanism
-Test Intent:   Validate that the auth endpoint implements rate
-               limiting to prevent credential stuffing attacks.
-Verification:  Send 6 rapid failed login attempts. Verify HTTP
-               429 is returned on the 6th attempt.
-Falsification: If HTTP 429 is returned before 10 attempts,
-               rate limiting is operational.
-Exploitability: Medium — requires automation but no special skill.
-Business Impact: Account takeover via credential stuffing.
+CONFIRMED    → HTTP 200 + JSON + real evidence passes all confirmation gates
+REFUTED      → HTTP 401/403/404, SPA fallback, empty response
+INCONCLUSIVE → HTTP 500, timeout, ambiguous
+TESTED       → HTTP 200 but not confirmable (HTML, too small, auth sent)
 ```
+
+State is held in `SessionIntelligence` — the single source of truth for the Reporter, eval harness, and Alpha's dedup logic. Alpha never re-probes a URL already in `confirmed_urls` or `disproven_urls`.
 
 ---
 
-## Safety Architecture
+## Safety Guarantees
 
-```
-5 layers of safety:
-
-1. Policy Gate (architecture-level)
-   - DELETE/PUT/PATCH permanently blocked in PASSIVE/PROBE
-   - Max 300 requests per PROBE scan
-   - Max 5 requests per endpoint
-   - No exploit payloads in any mode
-
-2. Validator (action-level)
-   - Every agent action passes through validate_action()
-   - HARDCODED_BLOCKS: exploit, reverse_shell, brute_force, etc.
-   - Mode permissions: strict allowlist per mode
-
-3. Pipeline (finding-level)
-   - CONFIRMED requires all criteria met
-   - Hallucination detection flags AI overconfidence
-   - SPA shell always REFUTED
-
-4. Evidence requirement
-   - Every CONFIRMED finding has request/response/proof
-   - Blast radius is measured, not estimated
-
-5. Consent gate (session-level)
-   - session.approved must be True
-   - ACTIVE mode requires typed confirmation phrase
-```
+- Every agent calls `validate_action()` before any HTTP request
+- No agent can touch a target not in `APPROVED_TARGETS`
+- No agent sends exploit payloads, modifies data, or brute forces credentials
+- PROBE mode is read-only by design — observation and confirmation only
+- Active mode requires explicit `--confirm` flag and second authorization
+- All findings require structured HTTP evidence — hallucinations are blocked by the scoring engine
+- `MAX_ALPHA_CYCLES = 6` — Alpha investigations are time-bounded
 
 ---
 
-## Evidence Standards
+## Core Invariants
 
-A finding is only as good as its evidence.
+The codebase enforces these at all times:
 
-### What CONFIRMED means:
-```
-Request:  GET http://target/api/endpoint
-Auth sent: NO
-Status:   200 OK
-Type:     JSON (59,605 bytes)
-Records:  111 returned
-Sensitive: password, token, apikey
-Proof:    Array[111], keys: ['id','name','solved','password'] | ⚠ Contains: password
-State:    CONFIRMED
-Reason:   HTTP 200 | JSON | 59605b | No auth | 111 records | Sensitive: password
-```
-
-### What NOT VULNERABLE means:
-```
-NOT VULNERABLE: /admin
-  Reason: SPA fallback — HTML shell, no privileged data
-  Evidence: HTTP 200 OK | 75,002 bytes | HTML
-
-NOT VULNERABLE: /api/users
-  Reason: Authentication enforced — 401/403 returned
-  Evidence: HTTP 401 Unauthorized | 972 bytes | HTML
-```
+1. URL is in exactly ONE of: `confirmed_urls`, `disproven_urls`, `inconclusive_urls`
+2. Settled endpoints are removed from `untested_queue`
+3. State precedence: `CONFIRMED > DISPROVEN > INCONCLUSIVE`
+4. Reporter reads from `SessionIntelligence` only — never from stale summaries
+5. No narrative stronger than evidence — AI confidence scores are calibrated against pipeline state
 
 ---
 
-## Evaluation and Benchmarking
+## Stack
 
-Sentinel tracks its own performance:
-
-```
-╔══ Eval Run: EVAL-20260410-085629 ══╗
-  Target:  http://localhost:3000
-  Mode:    PROBE
-  Duration: 95.2s
-
-  Detection Quality:
-    True positives:      7
-    False positives:     2
-    Precision:           78%
-    Recall:              70%
-
-  Pipeline Quality:
-    Hypotheses tested:   28
-    Confirmed findings:  4
-    Refuted (NOT vuln):  14
-    Confirmation rate:   14%
-
-  Evidence Quality:
-    With evidence:       4/4
-    With standards map:  4/4
-    Hallucinations blkd: 8
-    Time to 1st confirm: 12.3s
-
-  Chain Quality:
-    Confirmed chains:    2
-    Hallucinated chains: 0
-╚═══════════════════════════════════╝
-```
-
-Lab targets for eval:
-- OWASP Juice Shop (Node.js/Angular) — 10 known vulns mapped
-- VAmPI (Python, OWASP API Top 10) — coming
-- WebGoat (Java/J2EE) — coming
-- DVWA (PHP/MySQL) — coming
+- **Agent Reasoning:** Claude (`claude-sonnet-4-20250514`) via Anthropic API
+- **Agent Framework:** Custom Python — no LangChain/LangGraph dependency
+- **Evidence Layer:** `probe_with_evidence()` / `safe_request()` wrappers with scoped TLS
+- **Vulnerability Standards:** OWASP ASVS, WSTG, MITRE ATT&CK (835 techniques loaded)
+- **CVSS Scoring:** NVD API integration
+- **Backend:** Flask / Python
+- **Deployment:** Local (Docker optional for Juice Shop demo target)
 
 ---
 
-## Core Modules
+## Authorized Targets
 
-| Module | Purpose |
-|---|---|
-| `core/pipeline.py` | Formal finding state machine |
-| `core/scoring.py` | Evidence-based confidence (CVSS-anchored) |
-| `core/evidence.py` | Request/response artifact capture |
-| `core/standards.py` | OWASP ASVS/WSTG mapping engine |
-| `core/policy.py` | Policy enforcement gates |
-| `core/eval_harness.py` | Benchmarking and eval tracking |
-| `core/models.py` | ScanMode, Finding, ScanResult schemas |
-| `core/validator.py` | Action-level safety gate |
-| `core/attack_chains.py` | Chain analysis (CONFIRMED only) |
-| `core/mitre.py` | MITRE ATT&CK mapping |
-| `core/threat_intel.py` | Live ATT&CK data (835 techniques) |
-| `core/nvd_lookup.py` | NVD CVE lookup |
-| `core/audit.py` | Immutable audit log |
-| `core/auth_context.py` | Authentication context management |
-| `core/delta.py` | Cross-scan diffing |
-| `agents/queen_agent.py` | Sovereign commander |
-| `agents/alpha_agent.py` | Autonomous threat investigator |
-| `agents/orchestrator.py` | Iterative agent dispatcher |
-| `agents/probe_agent.py` | Endpoint/auth/IDOR probing |
-| `agents/injection_agent.py` | Injection condition detection |
-| `agents/auth_scan_agent.py` | Authenticated vulnerability scanning |
-
----
-
-## Quick Start
-
+### Demo (local, no authorization required)
 ```bash
-# Clone and install
-git clone https://github.com/Leishkychan/Sentinel.git
-cd sentinel
-pip install -e .
-cp .env.example .env
-# Add ANTHROPIC_API_KEY to .env
-
-# Run against Juice Shop (Docker)
 docker run -d -p 3000:3000 bkimminich/juice-shop
-
-# PASSIVE scan (read-only)
-py run_scan.py --target http://localhost:3000 --mode PASSIVE --confirm
-
-# PROBE scan (full Queen + Alpha pipeline)
-py run_scan.py --target http://localhost:3000 --mode PROBE --confirm
 ```
 
----
-
-## Roadmap
-
-### Phase 2 (current) — Verification Engine
-- [x] Finding pipeline with formal state transitions
-- [x] Evidence-first: every confirmed finding has request/response/proof
-- [x] OWASP ASVS/WSTG standards mapping
-- [x] Policy enforcement layer
-- [x] Negative validation (explicit NOT VULNERABLE records)
-- [x] Queen → Alpha autonomous reasoning hierarchy
-- [x] Hallucination detection and calibration
-- [x] Evaluation harness and benchmarking
-- [ ] Defender modes (gap analysis, regression, drift detection)
-- [ ] Multi-run memory and diffing
-- [ ] VAmPI, WebGoat, DVWA eval targets
-
-### Phase 3 — APEX (Multi-organizational)
-- [ ] APEX: multi-Queen coordination
-- [ ] Cross-target correlation
-- [ ] Organizational risk posture
-- [ ] Remediation tracking
-- [ ] Executive threat briefing
-
----
-
-## Ethics and Boundaries
-
-Sentinel is a **blue team tool**. It is designed to help defenders understand and fix vulnerabilities — not to exploit them.
-
-Hard boundaries that cannot be changed:
-- No exploit payloads in any mode
-- No credential brute force
-- No destructive HTTP methods
-- No persistence actions
-- No exfiltration of real data
-- Targets must be explicitly authorized
+### Live targets (require explicit written authorization)
+Sentinel has been used against:
+- **OWASP Juice Shop** — 4 confirmed unauthenticated API endpoints, TP=3, precision 30%
+- **WiCyS VDP** (`www.wicys.org`, `womenincybersecuritywicys.my.site.com`) — authorized via Bugcrowd, active VDP researcher
 
 **Never run Sentinel against systems you do not own or have explicit written authorization to test.**
 
 ---
 
-*Built by Leishka — [github.com/Leishkychan](https://github.com/Leishkychan)*
+## Setup
+
+```bash
+git clone https://github.com/Leishkychan/Sentinel.git
+cd sentinel
+
+python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+
+pip install -r requirements.txt
+
+cp .env.example .env
+# Add ANTHROPIC_API_KEY to .env
+```
+
+### Run a scan
+
+```bash
+# Set the Python path
+$env:PYTHONPATH = "C:\path\to\sentinel"   # Windows PowerShell
+export PYTHONPATH=/path/to/sentinel        # Linux/Mac
+
+# Approve target (required — no target probed without explicit approval)
+$env:APPROVED_TARGETS = "localhost,127.0.0.1"
+
+# Run
+python sentinel/run_scan.py --target http://localhost:3000 --mode PROBE --confirm
+```
+
+### Output
+```
+reports/sentinel_<session_id>_<timestamp>.json   ← structured findings with evidence
+reports/sentinel_<session_id>_<timestamp>.md     ← human-readable report
+```
+
+---
+
+## Project Status
+
+- [x] Phase 1 — Core pipeline: Orchestrator, Queen, Alpha, findings pipeline
+- [x] Phase 2 — Full agent suite: probe, js, api, disclosure, injection, auth_scan
+- [x] Phase 3 — Evidence refactor: real EvidenceRef on all confirmed findings
+- [x] Phase 4 — Session Intelligence: authoritative state, dedup, stop conditions
+- [x] Phase 5 — Tier 1 specialist agents: wordpress_enum, wordpress, salesforce
+- [x] Phase 6 — MITRE ATT&CK mapping, CVSS scoring, eval harness, attack chains
+- [ ] Phase 7 — Phase 5 evidence fix: probe_agent._check_api_endpoints migration
+- [ ] Phase 8 — Tier 2 agents: plugin fingerprinter, header auditor, sensitive file probe
+- [ ] Phase 9 — Severity accuracy: Queen risk verdict from confirmed findings only
+- [ ] Phase 10 — Flask UI + full Azure deployment
+
+---
+
+## Author
+
+Built by Leishka Pagan — Security & Cloud Infrastructure Engineer  
+[GitHub](https://github.com/Leishkychan) | [Portfolio](https://leishka-pagan.github.io)
+
+---
+
+*Sentinel is a blue team tool. It surfaces vulnerabilities for human review and remediation — never for exploitation. All scan targets require explicit prior written authorization.*
