@@ -148,7 +148,7 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
                 )
 
                 # 7b: FailedResponse is falsy
-                if not intro_resp:
+                if intro_resp is None or intro_resp.status_code == 0:
                     _record_failure(session, url,
                                     getattr(intro_resp, "failure_class", "other"),
                                     getattr(intro_resp, "failure_reason", ""))
