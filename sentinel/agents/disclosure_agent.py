@@ -185,10 +185,10 @@ def _check_sensitive_files(base: str, session: ScanSession) -> list[Finding]:
 
             # 7b: FailedResponse is falsy (status_code == 0, ok == False)
             # safe_request never returns None after 7b; this guard is a safety net
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
-                                getattr(resp, "failure_class", "other"),
-                                getattr(resp, "failure_reason", "unexpected None"))
+                                getattr(resp, "failure_class", "other") if resp is not None else "other",
+                                getattr(resp, "failure_reason", "") if resp is not None else "None returned by safe_request")
                 continue
 
             if resp.status_code == 200 and len(resp.content) > 0:
@@ -238,10 +238,10 @@ def _check_error_disclosure(base: str, session: ScanSession) -> list[Finding]:
 
             # 7b: FailedResponse is falsy (status_code == 0, ok == False)
             # safe_request never returns None after 7b; this guard is a safety net
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
-                                getattr(resp, "failure_class", "other"),
-                                getattr(resp, "failure_reason", "unexpected None"))
+                                getattr(resp, "failure_class", "other") if resp is not None else "other",
+                                getattr(resp, "failure_reason", "") if resp is not None else "None returned by safe_request")
                 continue
 
             if resp.status_code not in (400, 404, 500, 503):
@@ -318,10 +318,10 @@ def _check_directory_listing(base: str, session: ScanSession) -> list[Finding]:
 
             # 7b: FailedResponse is falsy (status_code == 0, ok == False)
             # safe_request never returns None after 7b; this guard is a safety net
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
-                                getattr(resp, "failure_class", "other"),
-                                getattr(resp, "failure_reason", "unexpected None"))
+                                getattr(resp, "failure_class", "other") if resp is not None else "other",
+                                getattr(resp, "failure_reason", "") if resp is not None else "None returned by safe_request")
                 continue
 
             if resp.status_code != 200:
@@ -390,10 +390,10 @@ def _check_debug_endpoints(base: str, session: ScanSession) -> list[Finding]:
 
             # 7b: FailedResponse is falsy (status_code == 0, ok == False)
             # safe_request never returns None after 7b; this guard is a safety net
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
-                                getattr(resp, "failure_class", "other"),
-                                getattr(resp, "failure_reason", "unexpected None"))
+                                getattr(resp, "failure_class", "other") if resp is not None else "other",
+                                getattr(resp, "failure_reason", "") if resp is not None else "None returned by safe_request")
                 continue
 
             if resp.status_code == 200 and len(resp.content) > 50:

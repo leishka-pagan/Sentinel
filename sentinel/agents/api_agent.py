@@ -104,7 +104,7 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
             )
 
             # 7b: FailedResponse is falsy — safe_request never returns None after 7b
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
                                 getattr(resp, "failure_class", "other"),
                                 getattr(resp, "failure_reason", ""))
@@ -208,7 +208,7 @@ def _check_api_docs(base: str, session: ScanSession) -> list[Finding]:
                                 allow_redirects=False)
 
             # 7b: FailedResponse is falsy — safe_request never returns None after 7b
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
                                 getattr(resp, "failure_class", "other"),
                                 getattr(resp, "failure_reason", ""))
@@ -286,7 +286,7 @@ def _check_api_versioning(base: str, session: ScanSession) -> list[Finding]:
                                     allow_redirects=False)
 
                 # 7b: FailedResponse is falsy
-                if not resp:
+                if resp is None or resp.status_code == 0:
                     _record_failure(session, url,
                                     getattr(resp, "failure_class", "other"),
                                     getattr(resp, "failure_reason", ""))
@@ -339,7 +339,7 @@ def _check_api_auth_headers(base: str, session: ScanSession) -> list[Finding]:
                                 allow_redirects=False)
 
             # 7b: FailedResponse is falsy — safe_request never returns None after 7b
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
                                 getattr(resp, "failure_class", "other"),
                                 getattr(resp, "failure_reason", ""))

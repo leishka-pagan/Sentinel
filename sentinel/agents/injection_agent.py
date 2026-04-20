@@ -165,7 +165,7 @@ def _check_search_injection(base: str, session: ScanSession,
                 resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
             # 7b: FailedResponse is falsy — safe_request never returns None after 7b
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
                                 getattr(resp, "failure_class", "other"),
                                 getattr(resp, "failure_reason", ""))
@@ -280,7 +280,7 @@ def _check_login_injection(base: str, session: ScanSession) -> list[Finding]:
 
             # 7b: FailedResponse is falsy (status_code == 0, ok == False)
             # safe_request never returns None after 7b; kept as safety net
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
                                 getattr(resp, "failure_class", "other"),
                                 getattr(resp, "failure_reason", ""))
@@ -343,7 +343,7 @@ def _check_api_injection(base: str, session: ScanSession,
             else:
                 resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url, getattr(resp, "failure_class", "other"), getattr(resp, "failure_reason", ""))
                 continue
 
@@ -402,7 +402,7 @@ def _check_xss_reflection(base: str, session: ScanSession,
                 resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
             # 7b: FailedResponse is falsy — safe_request never returns None after 7b
-            if not resp:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url,
                                 getattr(resp, "failure_class", "other"),
                                 getattr(resp, "failure_reason", ""))

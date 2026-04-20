@@ -219,7 +219,7 @@ def _check_api_endpoints(base: str, session: ScanSession) -> list[Finding]:
         resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
                             allow_redirects=False)
 
-        if not resp.ok and resp.status_code == 0:
+        if resp is None or resp.status_code == 0:
             # FailedResponse — network failure, not an HTTP error
             _record_failure(session, url, resp.failure_class, resp.failure_reason)
             continue
@@ -272,7 +272,7 @@ def _check_auth_weaknesses(base: str, session: ScanSession) -> list[Finding]:
         resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
                             allow_redirects=False)
 
-        if not resp.ok and resp.status_code == 0:
+        if resp is None or resp.status_code == 0:
             # FailedResponse — network failure, not an HTTP error
             _record_failure(session, url, resp.failure_class, resp.failure_reason)
             continue
@@ -366,7 +366,7 @@ def _check_idor(base: str, session: ScanSession) -> list[Finding]:
             resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
                                 allow_redirects=False)
 
-            if not resp.ok and resp.status_code == 0:
+            if resp is None or resp.status_code == 0:
                 _record_failure(session, url, resp.failure_class, resp.failure_reason)
                 continue
 
@@ -440,7 +440,7 @@ def _check_dangerous_methods(base: str, session: ScanSession) -> list[Finding]:
         # Stage 1: OPTIONS — 7c: was requests.options
         resp = safe_request("OPTIONS", url, headers=HEADERS, timeout=TIMEOUT)
 
-        if not resp.ok and resp.status_code == 0:
+        if resp is None or resp.status_code == 0:
             # FailedResponse — network failure, not an HTTP error
             _record_failure(session, url, resp.failure_class, resp.failure_reason)
             continue
@@ -464,7 +464,7 @@ def _check_dangerous_methods(base: str, session: ScanSession) -> list[Finding]:
             test_resp = safe_request(method, url, headers=HEADERS, timeout=TIMEOUT,
                                      allow_redirects=False)
 
-            if not test_resp.ok and test_resp.status_code == 0:
+            if test_resp is None or test_resp.status_code == 0:
                 # FailedResponse — network failure on dangerous method probe
                 _record_failure(session, url, test_resp.failure_class,
                                 test_resp.failure_reason)
@@ -531,7 +531,7 @@ def _check_rate_limiting(base: str, session: ScanSession) -> list[Finding]:
         # 7c: was requests.get — now safe_request
         check = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
-        if not check.ok and check.status_code == 0:
+        if check is None or check.status_code == 0:
             _record_failure(session, url, check.failure_class, check.failure_reason)
             continue
 
@@ -597,7 +597,7 @@ def _post_json(url: str, data: dict,
         allow_redirects=False,
         json=data,
     )
-    if not resp.ok and resp.status_code == 0:
+    if resp is None or resp.status_code == 0:
         # FailedResponse — record and return None so callers get a clean contract
         _record_failure(session, url, resp.failure_class, resp.failure_reason)
         return None

@@ -112,7 +112,7 @@ def _discover_js_files(base: str, session: ScanSession) -> list[str]:
     js_urls = []
     try:
         resp = safe_request("GET", base, headers=HEADERS, timeout=TIMEOUT)
-        if not resp.ok and resp.status_code == 0:
+        if resp is None or resp.status_code == 0:
             # FailedResponse — record failure and return empty list
             _record_failure(session, base, resp.failure_class, resp.failure_reason)
             return js_urls
@@ -157,7 +157,7 @@ def _fetch_js(url: str, session: ScanSession) -> str | None:
     """Fetch JS file content, skip if too large."""
     try:
         resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
-        if not resp.ok and resp.status_code == 0:
+        if resp is None or resp.status_code == 0:
             # FailedResponse — record and return None
             _record_failure(session, url, resp.failure_class, resp.failure_reason)
             return None
@@ -184,7 +184,7 @@ def _check_source_map(js_url: str, session: ScanSession) -> list[Finding]:
     map_url = js_url + ".map"
     try:
         resp = safe_request("GET", map_url, headers=HEADERS, timeout=TIMEOUT)
-        if not resp.ok and resp.status_code == 0:
+        if resp is None or resp.status_code == 0:
             # FailedResponse — map file not reachable, record and return
             _record_failure(session, map_url, resp.failure_class, resp.failure_reason)
             return findings
@@ -274,7 +274,7 @@ def _find_endpoints(content: str, js_url: str, base: str,
         for ep in list(all_endpoints)[:20]:
             url = base + ep if ep.startswith("/") else ep
             resp = safe_request("GET", url, headers=HEADERS, timeout=5)
-            if not resp.ok and resp.status_code == 0:
+            if resp is None or resp.status_code == 0:
                 # FailedResponse — record; endpoint unreachable
                 _record_failure(session, url, resp.failure_class,
                                 resp.failure_reason)
