@@ -94,7 +94,6 @@ class ChainIntersection:
 # next_step types:
 #   "sibling_namespace" — other endpoints in same URL namespace
 #   "id_variation"      — append /1, /2 to test IDOR
-#   "param_probe"       — add query parameters to test injection
 #   "admin_sibling"     — other endpoints in same admin namespace
 #   "direct_url"        — specific URL to test
 
@@ -130,18 +129,13 @@ PRECONDITION_MAP: dict[str, dict] = {
     },
 
     "sql_injection_condition": {
-        "chain_title": "SQL Injection Exploitation",
+        "chain_title": "SQL Injection Condition",
         "severity":    "CRITICAL",
-        "next_steps": [
-            {
-                "type":        "param_probe",
-                "param":       "q",
-                "payload_a":   "test' AND 1=1--",
-                "payload_b":   "test' AND 1=2--",
-                "description": "Boolean differential probe — confirms injectable parameter",
-                "priority":    1,
-            },
-        ],
+        # No direct next-step probes. Sentinel is a find-only tool and does not
+        # dispatch SQL payloads as part of chain expansion. A detected SQL
+        # injection condition can still participate in intersection-based
+        # prioritization when observed on the same asset as other chains.
+        "next_steps": [],
     },
 
     "sensitive_config_exposure": {
@@ -159,10 +153,10 @@ PRECONDITION_MAP: dict[str, dict] = {
     "no_rate_limiting": {
         "chain_title": "Brute Force Vector",
         "severity":    "MEDIUM",
-        "next_steps": [
-            # No direct probe — this chains with other findings
-            # Intersection with unauthenticated_api_access → CRITICAL
-        ],
+        # No direct next-step probes. A rate-limiting gap is a brute-force
+        # precondition; it can still participate in intersection-based
+        # prioritization when observed alongside unauthenticated access.
+        "next_steps": [],
     },
 
     "sensitive_data_exposure": {
@@ -191,7 +185,7 @@ INTERSECTION_RULES: list[dict] = [
         "chain_a": "sql_injection_condition",
         "chain_b": "unauthenticated_api_access",
         "combined_severity": "CRITICAL",
-        "description": "Unauthenticated access enables direct SQL injection exploitation",
+        "description": "Unauthenticated access observed on the same asset as a SQL injection condition",
     },
     {
         "chain_a": "sensitive_config_exposure",
@@ -344,11 +338,11 @@ class AttackGraph:
         if "admin" in url_lower:
             return "unauthenticated_admin_access"
 
-        # SQL injection — ONLY if behavioral differential was confirmed
+        # SQL injection — ONLY if explicit detection evidence is present
         # A search endpoint returning data is NOT injection — it's data exposure
-        # Injection requires explicit differential evidence in the evidence string
+        # Triggers on (a) explicit confirmation language, or
+        #             (b) SQL syntax errors surfaced in the response body
         if ("injection confirmed" in ev_lower or
-                ("boolean" in ev_lower and "differential" in ev_lower) or
                 ("sql" in ev_lower and "error" in ev_lower and "syntax" in ev_lower)):
             return "sql_injection_condition"
 
@@ -519,21 +513,6 @@ class AttackGraph:
                             candidate not in session_intel.confirmed_urls and
                             candidate not in session_intel.disproven_urls):
                         next_urls.append(candidate)
-
-            elif step_type == "param_probe":
-                # Only add param probes for endpoints already in the queue
-                # Never generate parameterized paths for arbitrary URLs
-                param   = step.get("param", "q")
-                p_a     = step.get("payload_a", "test")
-                p_b     = step.get("payload_b", "test2")
-                base_no_params = url.split("?")[0]
-                in_queue = any(base_no_params in u for u in (session_intel.untested_queue or []))
-                if in_queue or base_no_params in session_intel.confirmed_urls:
-                    url_a = f"{base_no_params}?{param}={p_a}"
-                    url_b = f"{base_no_params}?{param}={p_b}"
-                    for u in [url_a, url_b]:
-                        if u not in self._all_generated:
-                            next_urls.append(u)
 
         # Deduplicate, mark as generated
         unique_urls = []
