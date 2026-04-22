@@ -155,7 +155,6 @@ LANGUAGE RULES — violations will be flagged:
 ATTACK GRAPH: Every confirmed finding enables something.
   Unauthenticated endpoint → probe sibling endpoints, test IDOR
   No rate limiting → note as chain candidate (do not claim brute force without testing)
-  SQL condition → Boolean differential probe
   Follow the chain. Do not invent paths not supported by evidence.
 
 SELF-CORRECTION: Learn from every result.
