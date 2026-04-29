@@ -240,6 +240,59 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     return result
 
 
+def _detect_wordpress(base_url: str) -> bool:
+    """
+    Return True only if at least one WordPress platform signal is present.
+    Checks /wp-login.php, /wp-content/, /wp-json/ in order — stops on first hit.
+    A non-SPA HTML 200 or JSON 200 on any of these confirms WordPress.
+    """
+    from sentinel.core.evidence import safe_request
+    signals = ["/wp-login.php", "/wp-json/", "/wp-content/"]
+    for path in signals:
+        try:
+            resp = safe_request("GET", base_url.rstrip("/") + path, timeout=6)
+            if resp is None or resp.status_code == 0:
+                continue
+            if resp.status_code in (200, 301, 302, 403):
+                ct = resp.headers.get("Content-Type", "").lower()
+                # wp-json returns JSON; wp-login returns HTML login form (not SPA)
+                if "json" in ct or "wordpress" in resp.text[:500].lower() or \
+                   "wp-login" in resp.text[:500].lower():
+                    print(f"[ORCHESTRATOR] WordPress signal detected: {path} → {resp.status_code}")
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _detect_salesforce(base_url: str) -> bool:
+    """
+    Return True only if a Salesforce platform signal is present.
+    Gate 1: domain pattern (*.my.site.com, *.salesforce.com, *.force.com)
+    Gate 2: /services/data/ returns Salesforce-shaped JSON (list with 'version' keys)
+    Either gate alone is sufficient.
+    """
+    from urllib.parse import urlparse
+    import re
+    hostname = urlparse(base_url).hostname or ""
+    sf_domains = r"\.(my\.site\.com|salesforce\.com|force\.com|visualforce\.com)$"
+    if re.search(sf_domains, hostname, re.IGNORECASE):
+        print(f"[ORCHESTRATOR] Salesforce signal detected: domain match ({hostname})")
+        return True
+    from sentinel.core.evidence import safe_request
+    try:
+        resp = safe_request("GET", base_url.rstrip("/") + "/services/data/", timeout=6)
+        if resp is None or resp.status_code != 200:
+            return False
+        data = resp.json()
+        if isinstance(data, list) and data and "version" in str(data[0]):
+            print(f"[ORCHESTRATOR] Salesforce signal detected: /services/data/ returned version list")
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> list[Finding]:
     try:
         if agent == "sast_agent" and source_path:
@@ -292,14 +345,23 @@ def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> l
         elif agent == "wordpress_enum_agent":
             from sentinel.agents.wordpress_enum_agent import run_wordpress_enum_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            if not _detect_wordpress(url):
+                print(f"[ORCHESTRATOR] wordpress_enum_agent skipped — no WordPress signal on {url}")
+                return []
             return run_wordpress_enum_agent(session, url)
         elif agent == "wordpress_agent":
             from sentinel.agents.wordpress_agent import run_wordpress_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            if not _detect_wordpress(url):
+                print(f"[ORCHESTRATOR] wordpress_agent skipped — no WordPress signal on {url}")
+                return []
             return run_wordpress_agent(session, url)
         elif agent == "salesforce_agent":
             from sentinel.agents.salesforce_agent import run_salesforce_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
+            if not _detect_salesforce(url):
+                print(f"[ORCHESTRATOR] salesforce_agent skipped — no Salesforce signal on {url}")
+                return []
             return run_salesforce_agent(session, url)
         else:
             return []
