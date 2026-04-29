@@ -99,10 +99,64 @@ def run_probe_agent(session: ScanSession, target_url: str) -> list[Finding]:
 
 # ── Admin / Privileged Endpoints ──────────────────────────────────────────────
 
+def _fetch_spa_baseline(base: str) -> dict:
+    """
+    Fetch / to establish a baseline for SPA shell detection.
+    Returns dict with size, content_type, and body_hash of first 4KB.
+    Used to detect when admin paths return the same shell as the root.
+    """
+    import hashlib
+    try:
+        resp, artifact = probe_with_evidence(base + "/", method="GET", auth_sent=False)
+        if resp is None or resp.status_code != 200:
+            return {}
+        er = artifact.response
+        body_sample = resp.text[:4096] if hasattr(resp, "text") else ""
+        return {
+            "size":         er.size_bytes,
+            "content_type": er.content_type.lower(),
+            "body_hash":    hashlib.md5(body_sample.encode("utf-8", errors="ignore")).hexdigest(),
+        }
+    except Exception:
+        return {}
+
+
+def _is_spa_fallback(resp, er, baseline: dict) -> bool:
+    """
+    Return True if this response looks like the SPA shell serving a
+    client-side route rather than a real backend endpoint.
+
+    Requires ALL three signals:
+      1. Both responses are HTML
+      2. Response size within ±5% of baseline
+      3. First-4KB body hash matches baseline
+    """
+    if not baseline:
+        return False
+    import hashlib
+    resp_ctype = er.content_type.lower()
+    same_type  = "html" in baseline.get("content_type", "") and "html" in resp_ctype
+    if not same_type:
+        return False
+    baseline_size = baseline.get("size", 0)
+    same_size = (
+        baseline_size > 0 and
+        abs(er.size_bytes - baseline_size) / baseline_size <= 0.05
+    )
+    if not same_size:
+        return False
+    body_sample = resp.text[:4096] if hasattr(resp, "text") else ""
+    body_hash   = hashlib.md5(body_sample.encode("utf-8", errors="ignore")).hexdigest()
+    same_hash   = body_hash == baseline.get("body_hash", "")
+    return same_hash
+
+
 def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
     """Check for accessible admin/privileged endpoints without auth."""
     findings = []
-    SPA_SIZE_MIN, SPA_SIZE_MAX = 70000, 82000
+    baseline = _fetch_spa_baseline(base)
+    if baseline:
+        print(f"[PROBE] SPA baseline: {baseline['size']}b | {baseline['content_type']} | hash={baseline['body_hash'][:8]}...")
 
     for path in ADMIN_PATHS:
         url = base + path
@@ -120,10 +174,8 @@ def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
 
         if status == 200:
             content_len = er.size_bytes
-            is_spa = (SPA_SIZE_MIN < content_len < SPA_SIZE_MAX and
-                      "html" in er.content_type.lower())
 
-            if is_spa:
+            if _is_spa_fallback(resp, er, baseline):
                 findings.append(Finding(
                     agent=AgentName.PROBE,
                     title=f"SPA Route Responds: {path}",

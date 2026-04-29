@@ -45,7 +45,7 @@ def _get_client():
         _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     return _client
 
-ALPHA_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-5-20251001")
+ALPHA_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-6")
 FALLBACK_MODEL = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
 MAX_ALPHA_CYCLES = 6

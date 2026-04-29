@@ -48,7 +48,7 @@ def _get_client():
     if _client is None:
         _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     return _client
-QUEEN_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-5-20251001")
+QUEEN_MODEL    = os.getenv("QUEEN_MODEL", "claude-opus-4-6")
 FALLBACK_MODEL = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
 MAX_QUEEN_CYCLES = 2  # Queen-level decision cycles (each spawns Alpha work)

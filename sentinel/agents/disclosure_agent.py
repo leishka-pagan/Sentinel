@@ -397,6 +397,9 @@ def _check_debug_endpoints(base: str, session: ScanSession) -> list[Finding]:
                 continue
 
             if resp.status_code == 200 and len(resp.content) > 50:
+                # Skip SPA fallback responses — same check used for sensitive files
+                if not _is_real_file_response(resp, path):
+                    continue
                 findings.append(Finding(
                     agent=AgentName.DISCLOSURE,
                     title=f"Debug/Admin Endpoint Active in Production: {label}",

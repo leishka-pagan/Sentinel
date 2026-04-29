@@ -393,7 +393,7 @@ def _nvd_check(session: ScanSession, findings: list[Finding]) -> list[Finding]:
     }
 
     # Match "nginx/1.14.0" or "Apache 2.4.1" style version strings only
-    VERSION_PATTERN = re.compile(r'\b([\w\-\.]+)[/\s]+([\d]+\.[\d]+[\.[\d]*]*)\b')
+    VERSION_PATTERN = re.compile(r'\b([\w\-]+)[/\s]+(\d+\.\d+(?:\.\d+)?)\b')
 
     services = {}
     for f in findings:
