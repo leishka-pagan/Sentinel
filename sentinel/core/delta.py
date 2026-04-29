@@ -67,8 +67,9 @@ def compute_delta(current: ScanResult, target: str) -> DeltaReport:
     previous = _load_previous_scan(target)
     delta    = _build_delta(current, previous, target)
 
-    # Save current scan as the new baseline
-    _save_scan(current, target)
+    # Only save as baseline if scan produced results — empty/crashed scans never overwrite
+    if current.total > 0:
+        _save_scan(current, target)
 
     return delta
 
@@ -138,15 +139,23 @@ def _severity_rank(severity) -> int:
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 
-def _scan_file(target: str) -> Path:
-    """Get the path for the stored baseline scan for a target."""
-    safe = target.replace("://", "_").replace("/", "_").replace(":", "_")
-    return DELTA_DIR / f"baseline_{safe}.json"
+MAX_BASELINES = 5  # Maximum stored baselines per target
+
+
+def _target_slug(target: str) -> str:
+    """Stable slug for a target used in baseline filenames."""
+    return target.replace("://", "_").replace("/", "_").replace(":", "_")
 
 
 def _save_scan(result: ScanResult, target: str) -> None:
-    """Save current scan as the new baseline for this target."""
-    path = _scan_file(target)
+    """
+    Save current scan as a timestamped baseline.
+    Keeps the last MAX_BASELINES files; prunes older ones.
+    Never overwrites — each scan gets its own file.
+    """
+    slug      = _target_slug(target)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path      = DELTA_DIR / f"baseline_{slug}_{timestamp}.json"
     data = {
         "session_id": result.session_id,
         "target":     target,
@@ -156,14 +165,29 @@ def _save_scan(result: ScanResult, target: str) -> None:
     with open(path, "w") as fp:
         json.dump(data, fp, indent=2, default=str)
 
+    # Prune oldest baselines for this target beyond MAX_BASELINES
+    existing = sorted(
+        DELTA_DIR.glob(f"baseline_{slug}_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for old in existing[:-MAX_BASELINES]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
 
 def _load_previous_scan(target: str) -> Optional[dict]:
     """Load the most recent baseline scan for this target."""
-    path = _scan_file(target)
-    if not path.exists():
+    slug     = _target_slug(target)
+    existing = sorted(
+        DELTA_DIR.glob(f"baseline_{slug}_*.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not existing:
         return None
     try:
-        with open(path) as fp:
+        with open(existing[-1]) as fp:
             return json.load(fp)
     except (json.JSONDecodeError, IOError):
         return None

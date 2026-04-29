@@ -414,10 +414,18 @@ class FindingPipeline:
                 not auth_sent and
                 size >= self.MIN_CONTENT_SIZE):
 
-            # Proof snippet is REQUIRED for confirmation
+            # Proof snippet is REQUIRED for confirmation — no fabrication allowed
             if not proof_snippet:
-                proof_snippet = f"[{size}b JSON response — content captured]"
-                resp.proof_snippet = proof_snippet
+                bundle = EvidenceBundle(
+                    request=req,
+                    response=resp,
+                    finding_state=FindingState.TESTED,
+                    promotion_reason=(
+                        f"HTTP 200 | JSON | {size}b | No auth sent — "
+                        "INCONCLUSIVE: proof_snippet absent, cannot confirm"
+                    ),
+                )
+                return FindingState.TESTED, bundle, None
 
             bundle = EvidenceBundle(
                 request=req,

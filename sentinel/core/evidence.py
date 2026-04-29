@@ -475,7 +475,6 @@ def safe_request(method: str, url: str, headers: Optional[dict] = None,
     """
     from urllib.parse import urlparse
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
-    _requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
     base_headers = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
     if headers:
@@ -486,13 +485,15 @@ def safe_request(method: str, url: str, headers: Optional[dict] = None,
     is_lab = parsed.hostname in ("localhost", "127.0.0.1", "::1") or \
              (parsed.hostname or "").endswith(".local")
     verify = False if is_lab else True
+    if is_lab:
+        _requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
     try:
         return _requests.request(
             method.upper(), url,
             headers=base_headers,
             timeout=timeout,
-            verify=False,          # verify=False required — proxy intercepts TLS on non-lab targets
+            verify=verify,
             allow_redirects=kwargs.pop("allow_redirects", False),
             proxies={"http": "", "https": ""},  # bypass system proxy for scan targets
             **kwargs,
