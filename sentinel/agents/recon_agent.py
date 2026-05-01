@@ -273,20 +273,28 @@ def _port_scan_active(session: ScanSession, target: str) -> list[Finding]:
             capture_output=True, text=True, timeout=60,
         )
 
-        for port, (service, severity, remediation) in risky_ports.items():
-            if f"{port}/open" in result.stdout or f"<port protocol" in result.stdout:
-                # Parse XML output for open ports
-                if f'portid="{port}"' in result.stdout and 'state="open"' in result.stdout:
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(result.stdout)
+            for port_el in root.iter("port"):
+                portid = int(port_el.get("portid", -1))
+                state_el = port_el.find("state")
+                if (state_el is not None and
+                        state_el.get("state") == "open" and
+                        portid in risky_ports):
+                    service, severity, remediation = risky_ports[portid]
                     findings.append(Finding(
                         agent=AgentName.RECON,
-                        title=f"Open Port Detected: {port}/{service}",
-                        description=f"Port {port} ({service}) is open on {clean}.",
+                        title=f"Open Port Detected: {portid}/{service}",
+                        description=f"Port {portid} ({service}) is open on {clean}.",
                         severity=severity,
                         file_path=clean,
                         mitre_tactic="Reconnaissance",
                         mitre_technique="T1046 — Network Service Discovery",
                         remediation=remediation,
                     ))
+        except ET.ParseError:
+            pass  # nmap output was not valid XML
 
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass

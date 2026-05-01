@@ -31,7 +31,7 @@ from urllib.parse import urljoin
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
 )
-from sentinel.core.auth_context import AuthContext, get_test_credentials
+from sentinel.core.auth_context import AuthContext
 from sentinel.core.evidence import classify_failure
 
 HEADERS = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
@@ -42,51 +42,28 @@ def run_auth_scan_agent(session: ScanSession, target_url: str,
                          auth: Optional[AuthContext] = None) -> list[Finding]:
     """
     Run authenticated vulnerability scan.
-    If no auth context provided, attempts login with known test credentials.
+    Requires an already-logged-in AuthContext — does not attempt login itself.
+    If no logged-in AuthContext is provided, returns an INFO finding and exits.
     """
     validate_action(AgentName.AUTH_SCAN, "http_probe", target_url, session)
 
     base = target_url.rstrip("/")
     findings = []
-    auth_findings = []
 
-    # Get or create auth context
+    # CRITICAL #4: Never attempt login automatically.
+    # Authenticated scan requires an explicit, already-logged-in AuthContext.
     if not auth or not auth.logged_in:
-        auth = AuthContext()
-        creds = get_test_credentials(target_url)
-
-        for email, password in creds:
-            success, jwt_findings = auth.login(base, email, password)
-            auth_findings.extend(jwt_findings)
-            if success:
-                break
-
-    # Convert JWT findings to Finding objects
-    for jf in auth_findings:
         findings.append(Finding(
             agent=AgentName.AUTH_SCAN,
-            title=jf["title"],
-            description=jf["description"],
-            severity=Severity(jf["severity"]),
-            file_path=base + "/rest/user/login",
-            cve_id="CWE-347",
-            mitre_tactic="Credential Access",
-            mitre_technique="T1539 — Steal Web Session Cookie",
-            remediation=jf["remediation"],
-        ))
-
-    if not auth.logged_in:
-        findings.append(Finding(
-            agent=AgentName.AUTH_SCAN,
-            title="Could Not Authenticate — Authenticated Scan Skipped",
+            title="Authenticated Scan Skipped — No Auth Context Provided",
             description=(
-                "Sentinel attempted authentication with known test credentials "
-                "but could not log in. Provide credentials via --auth flag for "
-                "authenticated scanning."
+                "Authenticated scanning requires explicit credentials supplied "
+                "at scan invocation. No auth context was provided or the provided "
+                "context is not logged in. Authenticated checks were not performed."
             ),
             severity=Severity.INFO,
             file_path=base,
-            remediation="Provide credentials for authenticated scanning to find auth-dependent vulns.",
+            remediation="Provide an explicit logged-in AuthContext before running authenticated scans.",
         ))
         return findings
 

@@ -63,181 +63,197 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     from sentinel.core.session_intelligence import SessionIntelligence
     session._session_intel = SessionIntelligence(session.target, session.mode.value)
 
+    # Initialize policy gate for request budgeting and rate limiting (CRITICAL #3)
+    from sentinel.core.policy import get_policy, PolicyProfile
+    from sentinel.core.evidence import _policy_gate_ctx
+    mode_to_profile = {
+        "PASSIVE": PolicyProfile.PASSIVE,
+        "CODE": PolicyProfile.PASSIVE,
+        "PROBE": PolicyProfile.PROBE,
+        "ACTIVE": PolicyProfile.ACTIVE,
+    }
+    policy_profile = mode_to_profile.get(session.mode.value, PolicyProfile.PROBE)
+    session._policy_gate = get_policy(policy_profile)
+    _ctx_token = _policy_gate_ctx.set(session._policy_gate)
+    print(f"[ORCHESTRATOR] Policy gate initialized: {policy_profile.value} profile")
 
+    try:
+        all_findings: list[Finding] = []
+        agents_run:   list[AgentName] = []
+        done:         set = set()
+        iteration     = 0
 
-    all_findings: list[Finding] = []
-    agents_run:   list[AgentName] = []
-    done:         set = set()
-    iteration     = 0
+        # PROBE mode always runs all probe agents — don't let Claude skip them
+        if session.mode == ScanMode.PROBE:
+            queue = _default_agents(session, source_path)
+            print(f"[ORCHESTRATOR] PROBE mode — full agent suite: {queue}")
+        else:
+            plan  = _initial_plan(session, source_path)
+            queue = list(plan.get("agents_to_run", _default_agents(session, source_path)))
+            print(f"[ORCHESTRATOR] Plan: {queue} | {plan.get('rationale','')}")
 
-    # PROBE mode always runs all probe agents — don't let Claude skip them
-    if session.mode == ScanMode.PROBE:
-        queue = _default_agents(session, source_path)
-        print(f"[ORCHESTRATOR] PROBE mode — full agent suite: {queue}")
-    else:
-        plan  = _initial_plan(session, source_path)
-        queue = list(plan.get("agents_to_run", _default_agents(session, source_path)))
-        print(f"[ORCHESTRATOR] Plan: {queue} | {plan.get('rationale','')}")
+        # Dynamic ceiling: cover the full initial queue plus buffer for replan additions.
+        # MAX_ITERATIONS = 5 was too low for a 12-agent PROBE suite — agents at positions
+        # 6-12 could never dispatch. Buffer of 10 covers reasonable replan additions.
+        max_iterations = len(queue) + 10
 
-    # Dynamic ceiling: cover the full initial queue plus buffer for replan additions.
-    # MAX_ITERATIONS = 5 was too low for a 12-agent PROBE suite — agents at positions
-    # 6-12 could never dispatch. Buffer of 10 covers reasonable replan additions.
-    max_iterations = len(queue) + 10
+        while queue and iteration < max_iterations:
+            iteration += 1
+            agent = queue.pop(0)
+            if agent in done:
+                continue
 
-    while queue and iteration < max_iterations:
-        iteration += 1
-        agent = queue.pop(0)
-        if agent in done:
-            continue
+            print(f"[ORCHESTRATOR] [{iteration}] Dispatching {agent}...")
+            new_findings = _dispatch(agent, session, source_path)
+            done.add(agent)
 
-        print(f"[ORCHESTRATOR] [{iteration}] Dispatching {agent}...")
-        new_findings = _dispatch(agent, session, source_path)
-        done.add(agent)
+            if new_findings:
+                all_findings.extend(new_findings)
+                try: agents_run.append(AgentName(agent))
+                except ValueError: pass
+                print(f"[ORCHESTRATOR] → {len(new_findings)} findings")
+                for f in sorted(new_findings, key=lambda x: ["CRITICAL","HIGH","MEDIUM","LOW","INFO"].index(
+                        x.severity if x.severity in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"] else "INFO"))[:3]:
+                    print(f"  [{f.severity}] {f.title[:70]}")
 
-        if new_findings:
-            all_findings.extend(new_findings)
-            try: agents_run.append(AgentName(agent))
-            except ValueError: pass
-            print(f"[ORCHESTRATOR] → {len(new_findings)} findings")
-            for f in sorted(new_findings, key=lambda x: ["CRITICAL","HIGH","MEDIUM","LOW","INFO"].index(
-                    x.severity if x.severity in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"] else "INFO"))[:3]:
-                print(f"  [{f.severity}] {f.title[:70]}")
+                # Feed findings into session_intel immediately — so the next agent
+                # and Alpha never re-probe what this agent already settled
+                _populate_intel_from_findings(new_findings, session)
 
-            # Feed findings into session_intel immediately — so the next agent
-            # and Alpha never re-probe what this agent already settled
-            _populate_intel_from_findings(new_findings, session)
+            # Autonomous replanning — Claude decides what to run next based on findings
+            if not queue or any(f.severity in (Severity.CRITICAL, Severity.HIGH) for f in new_findings):
+                replan = _replan(session, source_path, all_findings, done, queue)
+                if replan.get("continue") and replan.get("next_agents"):
+                    adds = [a for a in replan["next_agents"] if a not in done]
+                    if adds:
+                        print(f"[ORCHESTRATOR] Replan → {adds} | {replan.get('reason','')}")
+                        queue.extend(adds)
 
-        # Autonomous replanning — Claude decides what to run next based on findings
-        if not queue or any(f.severity in (Severity.CRITICAL, Severity.HIGH) for f in new_findings):
-            replan = _replan(session, source_path, all_findings, done, queue)
-            if replan.get("continue") and replan.get("next_agents"):
-                adds = [a for a in replan["next_agents"] if a not in done]
-                if adds:
-                    print(f"[ORCHESTRATOR] Replan → {adds} | {replan.get('reason','')}")
-                    queue.extend(adds)
+            # Autonomous safety net — for PROBE/ACTIVE, reason about dropped agents
+            # Don't just blindly add them — ask Claude if they're still needed given findings
+            if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE):
+                probe_agents = ["probe_agent", "js_agent", "api_agent", "disclosure_agent",
+                                "wordpress_enum_agent", "wordpress_agent", "salesforce_agent"]
+                dropped = [a for a in probe_agents if a not in done and a not in queue]
+                if dropped and all_findings:
+                    decision = _should_run_dropped(dropped, all_findings, session)
+                    for agent, reason in decision.items():
+                        if agent not in done and agent not in queue:
+                            print(f"[ORCHESTRATOR] Autonomous decision → adding {agent}: {reason}")
+                            queue.append(agent)
 
-        # Autonomous safety net — for PROBE/ACTIVE, reason about dropped agents
-        # Don't just blindly add them — ask Claude if they're still needed given findings
-        if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE):
-            probe_agents = ["probe_agent", "js_agent", "api_agent", "disclosure_agent",
-                            "wordpress_enum_agent", "wordpress_agent", "salesforce_agent"]
-            dropped = [a for a in probe_agents if a not in done and a not in queue]
-            if dropped and all_findings:
-                decision = _should_run_dropped(dropped, all_findings, session)
-                for agent, reason in decision.items():
-                    if agent not in done and agent not in queue:
-                        print(f"[ORCHESTRATOR] Autonomous decision → adding {agent}: {reason}")
-                        queue.append(agent)
+        all_findings = enrich_all(all_findings)
 
-    all_findings = enrich_all(all_findings)
+        # NOTE: session_intel is populated per-agent at line 96 above.
+        # No second call needed here — enrichment only adds MITRE fields,
+        # it does not change URLs or confirmation state.
 
-    # NOTE: session_intel is populated per-agent at line 96 above.
-    # No second call needed here — enrichment only adds MITRE fields,
-    # it does not change URLs or confirmation state.
+        # Enrich with OWASP standards mapping
+        from sentinel.core.standards import enrich_finding_with_standards
+        for f in all_findings:
+            standards = enrich_finding_with_standards(f.title, f.description or "")
+            if standards.get("control_family") != "Uncategorized":
+                if not f.mitre_tactic or f.mitre_tactic == "Unknown":
+                    f.mitre_tactic = standards.get("control_family", f.mitre_tactic)
+                refs = standards.get("formatted_short", "")
+                if refs and refs not in (f.description or ""):
+                    f.description = (f.description or "") + f"\n📋 {refs}"
 
-    # Enrich with OWASP standards mapping
-    from sentinel.core.standards import enrich_finding_with_standards
-    for f in all_findings:
-        standards = enrich_finding_with_standards(f.title, f.description or "")
-        if standards.get("control_family") != "Uncategorized":
-            if not f.mitre_tactic or f.mitre_tactic == "Unknown":
-                f.mitre_tactic = standards.get("control_family", f.mitre_tactic)
-            refs = standards.get("formatted_short", "")
-            if refs and refs not in (f.description or ""):
-                f.description = (f.description or "") + f"\n📋 {refs}"
+        # Deduplicate and group root causes
+        all_findings = _deduplicate_findings(all_findings)
+        root_causes = _group_root_causes(all_findings, session)
+        if root_causes:
+            print(f"[ORCHESTRATOR] Root causes: {len(root_causes)} groups")
+            for rc in root_causes:
+                print(f"  [{rc['severity']}] {rc['title']}: {len(rc['endpoints'])} endpoints")
+            # Promote root causes to primary findings — replaces individual endpoint findings
+            # with a single grouped finding that names all affected endpoints
+            rc_findings = _root_causes_to_findings(root_causes)
+            all_findings.extend(rc_findings)
+        all_findings = _enrich_intel(all_findings)
+        all_findings.extend(_nvd_check(session, all_findings))
 
-    # Deduplicate and group root causes
-    all_findings = _deduplicate_findings(all_findings)
-    root_causes = _group_root_causes(all_findings, session)
-    if root_causes:
-        print(f"[ORCHESTRATOR] Root causes: {len(root_causes)} groups")
-        for rc in root_causes:
-            print(f"  [{rc['severity']}] {rc['title']}: {len(rc['endpoints'])} endpoints")
-        # Promote root causes to primary findings — replaces individual endpoint findings
-        # with a single grouped finding that names all affected endpoints
-        rc_findings = _root_causes_to_findings(root_causes)
-        all_findings.extend(rc_findings)
-    all_findings = _enrich_intel(all_findings)
-    all_findings.extend(_nvd_check(session, all_findings))
+        # QUEEN — sovereign commander
+        # Queen takes control for PROBE and ACTIVE modes
+        # She commands Alphas, correlates findings, delivers the final verdict
+        if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE) and all_findings:
+            print(f"\n[ORCHESTRATOR] Queen taking command...")
+            queen = QueenAgent(session, source_path)
+            queen_findings = queen.command(all_findings, done)
+            if queen_findings:
+                all_findings.extend(queen_findings)
+                print(f"[ORCHESTRATOR] Queen contributed {len(queen_findings)} additional findings")
 
-    # QUEEN — sovereign commander
-    # Queen takes control for PROBE and ACTIVE modes
-    # She commands Alphas, correlates findings, delivers the final verdict
-    if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE) and all_findings:
-        print(f"\n[ORCHESTRATOR] Queen taking command...")
-        queen = QueenAgent(session, source_path)
-        queen_findings = queen.command(all_findings, done)
-        if queen_findings:
-            all_findings.extend(queen_findings)
-            print(f"[ORCHESTRATOR] Queen contributed {len(queen_findings)} additional findings")
+        result = _build_result(session, all_findings, agents_run)
 
-    result = _build_result(session, all_findings, agents_run)
+        print(f"[ORCHESTRATOR] Running attack chain analysis...")
+        # Wire session onto result so chain engine can read session_intel confirmed URLs
+        result._session = session
+        chains = analyze_attack_chains(result)
 
-    print(f"[ORCHESTRATOR] Running attack chain analysis...")
-    # Wire session onto result so chain engine can read session_intel confirmed URLs
-    result._session = session
-    chains = analyze_attack_chains(result)
+        # Filter: only chains that pass eval validation reach the report
+        # eval_harness validates chains against confirmed_urls before scoring
+        # We pre-filter here so reporter never sees invalid chains
+        intel = getattr(session, '_session_intel', None)
+        confirmed_urls = intel.confirmed_urls if intel else set()
+        valid_chains = [
+            c for c in chains
+            if _chain_is_valid(c, confirmed_urls)
+        ]
+        if len(valid_chains) < len(chains):
+            print(f"[CHAIN] Filtered {len(chains) - len(valid_chains)} invalid chains — "
+                  f"{len(valid_chains)} valid chains remain")
+        chains = valid_chains
+        result.attack_chains = chains_to_dict(chains)
+        for c in chains:
+            print(f"  [{c.severity}] {c.title} ({c.confidence})")
 
-    # Filter: only chains that pass eval validation reach the report
-    # eval_harness validates chains against confirmed_urls before scoring
-    # We pre-filter here so reporter never sees invalid chains
-    intel = getattr(session, '_session_intel', None)
-    confirmed_urls = intel.confirmed_urls if intel else set()
-    valid_chains = [
-        c for c in chains
-        if _chain_is_valid(c, confirmed_urls)
-    ]
-    if len(valid_chains) < len(chains):
-        print(f"[CHAIN] Filtered {len(chains) - len(valid_chains)} invalid chains — "
-              f"{len(valid_chains)} valid chains remain")
-    chains = valid_chains
-    result.attack_chains = chains_to_dict(chains)
-    for c in chains:
-        print(f"  [{c.severity}] {c.title} ({c.confidence})")
+        delta = compute_delta(result, session.target)
+        result.delta_summary  = delta.summary
+        result.delta_markdown = delta_to_markdown(delta)
 
-    delta = compute_delta(result, session.target)
-    result.delta_summary  = delta.summary
-    result.delta_markdown = delta_to_markdown(delta)
+        result.summary = _summary(result, chains)
 
-    result.summary = _summary(result, chains)
+        # Surface pipeline summary from session_intel (authoritative)
+        if hasattr(session, '_session_intel') and session._session_intel:
+            si = session._session_intel
+            si_summary = si.get_summary()
+            total_probed = si_summary.get('total_requests', 0)
+            confirmed    = si_summary.get('confirmed', 0)
+            disproven    = si_summary.get('disproven', 0)
+            rate         = round(confirmed / max(total_probed, 1), 2)
 
-    # Surface pipeline summary from session_intel (authoritative)
-    if hasattr(session, '_session_intel') and session._session_intel:
-        si = session._session_intel
-        si_summary = si.get_summary()
-        total_probed = si_summary.get('total_requests', 0)
-        confirmed    = si_summary.get('confirmed', 0)
-        disproven    = si_summary.get('disproven', 0)
-        rate         = round(confirmed / max(total_probed, 1), 2)
+            print(f"[PIPELINE] Summary: {total_probed} tested | "
+                  f"{confirmed} confirmed | "
+                  f"{disproven} refuted | "
+                  f"confirmation rate: {rate:.0%}")
 
-        print(f"[PIPELINE] Summary: {total_probed} tested | "
-              f"{confirmed} confirmed | "
-              f"{disproven} refuted | "
-              f"confirmation rate: {rate:.0%}")
+            result.pipeline_summary = {
+                'hypotheses_tested':    total_probed,
+                'confirmed_findings':   confirmed,
+                'refuted_findings':     disproven,
+                'inconclusive':         si_summary.get('inconclusive', 0),
+                'confirmation_rate':    rate,
+                'probes_prevented':     si_summary.get('probes_prevented', 0),
+                'root_causes':          si_summary.get('root_causes', 0),
+                'chain_candidates':     si_summary.get('chain_candidates', 0),
+                'attack_graph':         si.attack_graph.get_summary() if si.attack_graph else {},
+            }
+            result.negative_validations = disproven
 
-        result.pipeline_summary = {
-            'hypotheses_tested':    total_probed,
-            'confirmed_findings':   confirmed,
-            'refuted_findings':     disproven,
-            'inconclusive':         si_summary.get('inconclusive', 0),
-            'confirmation_rate':    rate,
-            'probes_prevented':     si_summary.get('probes_prevented', 0),
-            'root_causes':          si_summary.get('root_causes', 0),
-            'chain_candidates':     si_summary.get('chain_candidates', 0),
-            'attack_graph':         si.attack_graph.get_summary() if si.attack_graph else {},
-        }
-        result.negative_validations = disproven
+        # Run eval scoring
+        eval_run = eval_harness.score(result)
+        print(f"\n[EVAL] {eval_run.format_scorecard()}")
+        eval_harness.save_run(eval_run)
+        # Store as dict (Pydantic requires serializable types)
+        import dataclasses
+        result.eval_run = dataclasses.asdict(eval_run) if dataclasses.is_dataclass(eval_run) else {}
 
-    # Run eval scoring
-    eval_run = eval_harness.score(result)
-    print(f"\n[EVAL] {eval_run.format_scorecard()}")
-    eval_harness.save_run(eval_run)
-    # Store as dict (Pydantic requires serializable types)
-    import dataclasses
-    result.eval_run = dataclasses.asdict(eval_run) if dataclasses.is_dataclass(eval_run) else {}
+        print(f"[ORCHESTRATOR] DONE: {result.total} findings | {len(chains)} chains")
+        return result
 
-    print(f"[ORCHESTRATOR] DONE: {result.total} findings | {len(chains)} chains")
-    return result
+    finally:
+        _policy_gate_ctx.reset(_ctx_token)
 
 
 def _detect_wordpress(base_url: str) -> bool:
@@ -626,53 +642,29 @@ def _populate_intel_from_findings(findings: list, session):
     Called after EVERY agent dispatch — ensures session_intel stays current
     so Alpha never re-probes what any earlier agent already settled.
 
-    Writes to SessionIntelligence in this priority order:
-      - DISPROVEN: for 401/403 and SPA fallback (deterministic HTTP signals)
-      - INCONCLUSIVE: for HTTP 500 (deterministic HTTP signal)
+    Writes to SessionIntelligence:
       - CONFIRMED: only when f.evidence is present AND passes is_sufficient_for_confirmation()
       - Queue additions: JS-discovered endpoints (not state transitions)
-    Any finding without structured evidence that claims confirmation via text alone
-    is left as supporting detail only — not promoted into authoritative session state.
+    Findings without structured evidence are left as supporting detail only —
+    never promoted into authoritative DISPROVEN, INCONCLUSIVE, or CONFIRMED state.
     """
     intel = getattr(session, '_session_intel', None)
     if not intel:
         return
-
-    from sentinel.core.session_intelligence import DisproveReason as _DR
 
     for f in findings:
         url = f.file_path or ""
         if not url or not url.startswith("http"):
             continue
 
-        title = (f.title or "").lower()
-        desc  = (f.description or "").lower()
-
-        # DISPROVEN: 401/403 — authentication enforced (deterministic HTTP signal)
-        if "401" in desc or "auth: required" in desc or "authentication enforced" in desc:
-            if url not in intel.disproven_urls:
-                intel.record_disproven(url, _DR.AUTH_ENFORCED)
-
-        # DISPROVEN: SPA shell — client-side route, no server data (deterministic size+type signal)
-        elif "spa route" in title or "spa shell" in desc or "spa fallback" in desc:
-            if url not in intel.disproven_urls:
-                intel.record_disproven(url, _DR.SPA_FALLBACK)
-
-        # INCONCLUSIVE: HTTP 500 — server error, cannot determine safe or unsafe (deterministic)
-        elif "500" in desc or "server error" in desc or "inconclusive" in title:
-            if url not in intel.inconclusive_urls:
-                intel.record_inconclusive(url, reason="HTTP 500 from probe_agent")
-
-        # CONFIRMED: only when f.evidence carries real structured proof from probe_with_evidence.
-        # Double-write is prevented by checking confirmed_urls first — record_confirmed is also
-        # idempotent, but the check avoids the call entirely when Alpha already settled this URL.
-        # If evidence fails is_sufficient_for_confirmation(), the finding is left as supporting
-        # detail only — record_inconclusive is NOT called for failed confirmation evidence.
-        elif f.evidence is not None and url not in intel.confirmed_urls:
+        # CONFIRMED: only when f.evidence carries real structured proof.
+        # Double-write is prevented by checking confirmed_urls first.
+        # If evidence fails is_sufficient_for_confirmation(), the finding is left as
+        # supporting detail only — no state is written.
+        if f.evidence is not None and url not in intel.confirmed_urls:
             ok, _ = f.evidence.is_sufficient_for_confirmation()
             if ok:
                 intel.record_confirmed(url, f.evidence)
-            # else: leave as supporting detail — do not write any state
 
         # Extract discovered endpoints from JS agent metadata (structured field, not freeform text)
         meta = getattr(f, 'metadata', {}) or {}

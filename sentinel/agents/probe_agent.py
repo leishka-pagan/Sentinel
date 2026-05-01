@@ -23,10 +23,11 @@ NEVER: submits exploit payloads, modifies data, brute forces,
 import json
 import re
 import sys
+import time
 import requests
 from urllib.parse import urljoin, urlparse, urlencode
 
-from sentinel.core.evidence import probe_with_evidence, safe_request, classify_failure
+from sentinel.core.evidence import probe_with_evidence, safe_request, classify_failure, find_sensitive_fields_in_json
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
 )
@@ -267,8 +268,21 @@ def _check_api_endpoints(base: str, session: ScanSession) -> list[Finding]:
                     data = resp.json()
                     if isinstance(data, list) and len(data) > 0:
                         sample    = str(data[0])[:200]
-                        sensitive = _check_sensitive_fields(sample)
+                        sensitive = find_sensitive_fields_in_json(resp.text)
                         severity  = Severity.CRITICAL if sensitive else Severity.HIGH
+
+                        from sentinel.core.models import EvidenceRef as _ERef
+                        _ev = _ERef(
+                            method="GET",
+                            url=url,
+                            status_code=resp.status_code,
+                            response_type="JSON",
+                            size_bytes=len(resp.content),
+                            auth_sent=False,
+                            sensitive_fields=sensitive,
+                            record_count=len(data),
+                            proof_snippet=sample,
+                        )
 
                         findings.append(Finding(
                             agent=AgentName.PROBE,
@@ -281,6 +295,7 @@ def _check_api_endpoints(base: str, session: ScanSession) -> list[Finding]:
                             ),
                             severity=severity,
                             file_path=url,
+                            evidence=_ev,
                             mitre_tactic="Collection",
                             mitre_technique="T1213 — Data from Information Repositories",
                             remediation=(
@@ -316,8 +331,28 @@ def _check_auth_weaknesses(base: str, session: ScanSession) -> list[Finding]:
         if resp.status_code not in (200, 405):
             continue
 
+        # User enumeration requires a known-valid reference email for this target.
+        # Without one, the valid/invalid comparison is meaningless — both requests
+        # return "unknown email" and the check never fires.
+        # Provide session._reference_email to enable this check.
+        reference_email = getattr(session, '_reference_email', None)
+        if not reference_email:
+            findings.append(Finding(
+                agent=AgentName.PROBE,
+                title=f"User Enumeration Check Skipped: {path}",
+                description=(
+                    f"Auth endpoint {url} was not tested for user enumeration. "
+                    "A known-valid reference email for this target is required. "
+                    "Set session._reference_email to enable this check."
+                ),
+                severity=Severity.INFO,
+                file_path=url,
+                remediation="Supply a known-valid email for this target to enable enumeration detection.",
+            ))
+            continue
+
         test_valid   = _post_json(url, {
-            "email":    "admin@juice-sh.op",
+            "email":    reference_email,
             "password": "definitely-wrong-password-sentinel-test",
         }, session)
         test_invalid = _post_json(url, {
@@ -557,7 +592,7 @@ def _check_dangerous_methods(base: str, session: ScanSession) -> list[Finding]:
 def _check_rate_limiting(base: str, session: ScanSession) -> list[Finding]:
     """
     Check if auth endpoints have rate limiting.
-    Sends 5 requests — NOT brute force, just checking if protection exists.
+    Sends 9 requests with 200ms spacing — NOT brute force, just checking if protection exists.
     """
     findings = []
 
@@ -575,13 +610,14 @@ def _check_rate_limiting(base: str, session: ScanSession) -> list[Finding]:
             continue
 
         responses = []
-        for _ in range(5):
+        for _ in range(9):
             resp = _post_json(url, {
                 "email":    "ratelimit_test_sentinel@example.com",
                 "password": "wrong_password_test",
             }, session)
             if resp:
                 responses.append(resp.status_code)
+            time.sleep(0.2)
 
         if (responses and
                 all(r not in (429, 423, 503) for r in responses) and
@@ -591,7 +627,8 @@ def _check_rate_limiting(base: str, session: ScanSession) -> list[Finding]:
                 title=f"No Rate Limiting on Auth Endpoint: {path}",
                 description=(
                     f"Auth endpoint {url} returned consistent {responses[0]} responses "
-                    "across 5 rapid requests with no rate limiting detected (no HTTP 429). "
+                    "across 9 requests with 200ms spacing — no rate limiting detected "
+                    "(no HTTP 429/423/503, no status change). "
                     "This endpoint is vulnerable to credential stuffing and brute force attacks."
                 ),
                 severity=Severity.HIGH,
@@ -639,17 +676,3 @@ def _post_json(url: str, data: dict,
         return None
     return resp
 
-
-def _check_sensitive_fields(text: str) -> list[str]:
-    """Check if response contains sensitive field names."""
-    sensitive_patterns = [
-        "password", "passwd", "secret", "token", "api_key",
-        "credit_card", "ssn", "social_security", "private_key",
-        "access_token", "refresh_token", "auth_token",
-    ]
-    found      = []
-    text_lower = text.lower()
-    for pattern in sensitive_patterns:
-        if pattern in text_lower:
-            found.append(pattern)
-    return found

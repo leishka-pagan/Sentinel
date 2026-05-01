@@ -330,10 +330,10 @@ class QueenAgent:
 
             action_id = (primary.get("agent") or
                          primary.get("probe", {}).get("url", "unknown"))
-            alpha.evaluate_result(action_id, result_f, success)
+            verdict = alpha.evaluate_result(action_id, result_f, success)
             new_findings.extend(result_f)
 
-            if alpha.evaluate_result.__doc__ and "complete" in str(result_f):
+            if verdict == "confirmed":
                 break
 
         conclusion = alpha.conclude()
@@ -504,8 +504,17 @@ Return your strategic directive as JSON."""
 
     def _identify_compound_risks(self):
         """Identify findings that create compound risks when combined."""
-        all_f   = self.intelligence.all_findings
-        titles  = [f.title.lower() for f in all_f]
+        # CRITICAL #7: only consider confirmed findings — refuted findings
+        # must not contribute titles to compound risk matching.
+        # f.file_path is the canonical URL field (see orchestrator._populate_intel_from_findings
+        # line 644 and _summary line 871 — both use f.file_path against confirmed_urls).
+        intel = getattr(self.session, '_session_intel', None)
+        confirmed_urls = intel.confirmed_urls if intel else set()
+        confirmed_f = [f for f in self.intelligence.all_findings
+                       if f.file_path and f.file_path in confirmed_urls]
+        if not confirmed_f:
+            return
+        titles = [f.title.lower() for f in confirmed_f]
 
         # Check for dangerous combinations
         combinations = [
@@ -616,56 +625,76 @@ Include executive summary, top attack paths, remediation priority, and defensive
 
     def _verdict_to_findings(self, verdict: dict) -> list[Finding]:
         """Convert Queen's verdict into Finding objects for the report."""
+
+        # Gate 1: require confirmed evidence — no confirmed URLs means nothing to report
+        intel = getattr(self.session, '_session_intel', None)
+        confirmed_urls = intel.confirmed_urls if intel else set()
+        if not confirmed_urls:
+            return []
+
+        # Gate 2: invalid or error verdict — do not emit findings from a bad parse
+        if not verdict or verdict.get("status") == "error":
+            return []
+
+        VALID_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+
         findings = []
 
-        # Queen's executive summary as a finding
-        if verdict.get("executive_summary"):
+        # Executive Threat Briefing — only if organizational_risk is an explicit valid value
+        org_risk = verdict.get("organizational_risk")
+        if verdict.get("executive_summary") and org_risk in VALID_SEVERITIES:
             findings.append(Finding(
                 agent=AgentName.QUEEN,
                 title="[Queen] Executive Threat Briefing",
                 description=verdict["executive_summary"],
-                severity=Severity(verdict.get("organizational_risk", "HIGH")),
+                severity=Severity(org_risk),
                 mitre_tactic="Multiple",
                 mitre_technique="Multi-stage campaign",
                 remediation="; ".join(verdict.get("immediate_actions", [])[:3]),
             ))
 
-        # Compound risks as findings
+        # Compound risks — only if severity is an explicit valid value
         for risk in self.intelligence.cross_target_chains:
+            risk_severity = risk.get("severity")
+            if risk_severity not in VALID_SEVERITIES:
+                continue
             findings.append(Finding(
                 agent=AgentName.QUEEN,
                 title=f"[Queen] Compound Risk: {risk['title']}",
                 description=risk.get("combined_impact", ""),
-                severity=Severity(risk.get("severity", "HIGH")),
+                severity=Severity(risk_severity),
                 mitre_tactic="Multiple",
                 mitre_technique="Chained vulnerability exploitation",
                 remediation="Address each component vulnerability independently. "
                             "See individual findings for specific remediation steps.",
             ))
 
-        # Defensive posture score
-        score = verdict.get("defensive_posture_score", "F")
-        findings.append(Finding(
-            agent=AgentName.QUEEN,
-            title=f"[Queen] Defensive Posture Score: {score}",
-            description=(
-                f"Overall defensive posture for {self.session.target}: {score}. "
-                f"Organizational risk level: {verdict.get('organizational_risk','HIGH')}. "
-                f"Threat actor profile: {verdict.get('threat_actor_profile','Unknown')}."
-            ),
-            severity=Severity.CRITICAL if score in ("F", "D") else Severity.HIGH,
-            mitre_tactic="Multiple",
-            remediation="\n".join(
-                f"{r['priority']}. {r['action']}"
-                for r in verdict.get("remediation_priority", [])[:3]
-            ),
-        ))
+        # Defensive posture — only if score is explicitly present in verdict
+        # and confirmed evidence exists (already gated above)
+        score = verdict.get("defensive_posture_score")
+        if score is not None:
+            sev = Severity.CRITICAL if score in ("F", "D") else Severity.HIGH
+            findings.append(Finding(
+                agent=AgentName.QUEEN,
+                title=f"[Queen] Defensive Posture Score: {score}",
+                description=(
+                    f"Overall defensive posture for {self.session.target}: {score}. "
+                    f"Organizational risk level: {org_risk or 'Unknown'}. "
+                    f"Threat actor profile: {verdict.get('threat_actor_profile', 'Unknown')}."
+                ),
+                severity=sev,
+                mitre_tactic="Multiple",
+                remediation="\n".join(
+                    f"{r['priority']}. {r['action']}"
+                    for r in verdict.get("remediation_priority", [])[:3]
+                ),
+            ))
 
         return findings
 
     def _force_verdict(self, sev_counts: dict) -> dict:
         return {
-            "status": "verdict",
+            "status": "error",
             "investigation_complete": True,
             "organizational_risk": "CRITICAL" if sev_counts.get("CRITICAL", 0) > 0 else "HIGH",
             "executive_summary": (
